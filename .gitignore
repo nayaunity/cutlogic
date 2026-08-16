@@ -11,3 +11,4 @@ output.mp4
 *.m4a
 __pycache__/
 .DS_Store
+script*.txt
