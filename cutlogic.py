@@ -172,12 +172,23 @@ def align(sentences: list, words: list, threshold: float) -> tuple:
     return matches, warnings
 
 
-def build_segments(matches: list, pad_pre: float, pad_post: float,
-                   merge_gap: float, duration: float) -> list:
-    segs = []
+def build_segments(matches: list, words: list, pad_pre: float, pad_post: float,
+                   merge_gap: float, max_pause: float, duration: float) -> list:
+    # Split each matched sentence at internal silences longer than max_pause
+    # (reading pauses, breaths) so dead air inside a take gets cut too.
+    spans = []
     for m in matches:
-        t0 = max(0.0, m.t0 - pad_pre)
-        t1 = min(duration, m.t1 + pad_post)
+        run_start = m.wstart
+        for i in range(m.wstart, m.wend):
+            if words[i + 1]["start"] - words[i]["end"] > max_pause:
+                spans.append((words[run_start]["start"], words[i]["end"]))
+                run_start = i + 1
+        spans.append((words[run_start]["start"], words[m.wend]["end"]))
+
+    segs = []
+    for t0, t1 in spans:
+        t0 = max(0.0, t0 - pad_pre)
+        t1 = min(duration, t1 + pad_post)
         if segs and t0 - segs[-1][1] <= merge_gap:
             segs[-1][1] = max(segs[-1][1], t1)
         else:
@@ -240,6 +251,8 @@ def main() -> None:
     ap.add_argument("--pad-post", type=float, default=0.25, help="seconds kept after each match")
     ap.add_argument("--merge-gap", type=float, default=0.3,
                     help="merge segments closer than this many seconds")
+    ap.add_argument("--max-pause", type=float, default=0.6,
+                    help="cut silences inside a sentence longer than this many seconds")
     ap.add_argument("--work-dir", type=Path, default=Path("work"))
     args = ap.parse_args()
 
@@ -272,7 +285,8 @@ def main() -> None:
     for m in matches:
         print(f"{m.score:6.2f}  {fmt_t(m.t0):>9}  {fmt_t(m.t1):>9}  {m.sentence[:70]}")
 
-    segs = build_segments(matches, args.pad_pre, args.pad_post, args.merge_gap, duration)
+    segs = build_segments(matches, words, args.pad_pre, args.pad_post,
+                          args.merge_gap, args.max_pause, duration)
     kept = sum(t1 - t0 for t0, t1 in segs)
     print(f"\n{len(matches)}/{len(sentences)} sentences matched -> {len(segs)} segment(s), "
           f"keeping {fmt_t(kept)} of {fmt_t(duration)}")
