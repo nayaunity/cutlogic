@@ -1,0 +1,13 @@
+.env
+work/
+output.mp4
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.wav
+*.ogg
+*.mp3
+*.m4a
+__pycache__/
+.DS_Store
