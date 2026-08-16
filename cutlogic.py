@@ -402,11 +402,11 @@ def main() -> None:
     ap.add_argument("-o", "--output", type=Path, default=Path("output.mp4"))
     ap.add_argument("--dry-run", action="store_true", help="print cut list, don't render")
     ap.add_argument("--threshold", type=float, default=0.8, help="match score cutoff (0-1)")
-    ap.add_argument("--pad-pre", type=float, default=0.15, help="seconds kept before each match")
-    ap.add_argument("--pad-post", type=float, default=0.25, help="seconds kept after each match")
-    ap.add_argument("--merge-gap", type=float, default=0.3,
+    ap.add_argument("--pad-pre", type=float, default=0.05, help="seconds kept before each match")
+    ap.add_argument("--pad-post", type=float, default=0.12, help="seconds kept after each match")
+    ap.add_argument("--merge-gap", type=float, default=0.15,
                     help="merge segments closer than this many seconds")
-    ap.add_argument("--max-pause", type=float, default=0.6,
+    ap.add_argument("--max-pause", type=float, default=0.35,
                     help="cut silences inside a sentence longer than this many seconds")
     ap.add_argument("--work-dir", type=Path, default=Path("work"))
     args = ap.parse_args()
