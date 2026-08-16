@@ -71,36 +71,81 @@ def extract_audio(video: Path, work: Path) -> Path:
     return audio
 
 
+def deepgram_post(payload: bytes, api_key: str) -> dict:
+    req = urllib.request.Request(
+        DEEPGRAM_URL,
+        data=payload,
+        headers={"Authorization": f"Token {api_key}", "Content-Type": "audio/ogg"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        die(f"Deepgram HTTP {e.code}: {e.read().decode(errors='replace')[:500]}")
+    except urllib.error.URLError as e:
+        die(f"could not reach Deepgram: {e.reason}")
+
+
+def resp_words(data: dict) -> list:
+    try:
+        return data["results"]["channels"][0]["alternatives"][0]["words"]
+    except (KeyError, IndexError):
+        return []
+
+
+def recover_gaps(video: Path, words: list, work: Path, api_key: str,
+                 min_gap: float = 1.5) -> list:
+    """Re-transcribe long inter-word silences in isolation.
+
+    The full-file pass sometimes skips quiet false starts inside pauses;
+    those hidden words matter because cut padding must not bleed into them.
+    """
+    recovered = []
+    ctx = 1.0  # transcribe with surrounding context; tiny clips transcribe poorly
+    for i in range(len(words) - 1):
+        g0, g1 = words[i]["end"], words[i + 1]["start"]
+        if g1 - g0 < min_gap:
+            continue
+        c0 = max(0.0, g0 - ctx)
+        clip = work / "gap.ogg"
+        run(["ffmpeg", "-y", "-ss", f"{c0:.2f}", "-to", f"{g1 + ctx:.2f}", "-i", str(video),
+             "-vn", "-ac", "1", "-c:a", "libopus", "-b:a", "32k", str(clip)],
+            f"extracting gap {g0:.1f}-{g1:.1f}s")
+        for w in resp_words(deepgram_post(clip.read_bytes(), api_key)):
+            s, e = w["start"] + c0, w["end"] + c0
+            if not (g0 <= (s + e) / 2 <= g1):
+                continue  # context region; those words are already in the list
+            recovered.append({"word": w["word"], "start": round(s, 3), "end": round(e, 3)})
+    clip = work / "gap.ogg"
+    if clip.exists():
+        clip.unlink()
+    if recovered:
+        print(f"      recovered {len(recovered)} hidden word(s) inside pauses")
+    return sorted(words + recovered, key=lambda w: w["start"])
+
+
 def transcribe(video: Path, audio: Path, work: Path, api_key: str) -> list:
-    """Return flat word list [{word, start, end}, ...], caching the raw response."""
+    """Return flat word list [{word, start, end}, ...], caching the result."""
     cache = work / f"{video.stem}.transcript.json"
     if cache.exists() and cache.stat().st_mtime >= video.stat().st_mtime:
         print(f"[2/4] using cached transcript: {cache}")
         data = json.loads(cache.read_text())
     else:
         print("[2/4] transcribing with Deepgram (nova-3)...")
-        req = urllib.request.Request(
-            DEEPGRAM_URL,
-            data=audio.read_bytes(),
-            headers={"Authorization": f"Token {api_key}", "Content-Type": "audio/ogg"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=600) as resp:
-                data = json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            die(f"Deepgram HTTP {e.code}: {e.read().decode(errors='replace')[:500]}")
-        except urllib.error.URLError as e:
-            die(f"could not reach Deepgram: {e.reason}")
+        data = deepgram_post(audio.read_bytes(), api_key)
         cache.write_text(json.dumps(data, indent=2))
         print(f"      transcript saved to {cache}")
 
-    try:
-        words = data["results"]["channels"][0]["alternatives"][0]["words"]
-    except (KeyError, IndexError):
-        die("transcript has no words — is there speech in the video?")
+    words = resp_words(data)
     if not words:
-        die("transcript is empty — is there speech in the video?")
+        die("transcript has no words — is there speech in the video?")
+
+    if data.get("cutlogic_gap_recovered") != 2:
+        words = recover_gaps(video, words, work, api_key)
+        data["results"]["channels"][0]["alternatives"][0]["words"] = words
+        data["cutlogic_gap_recovered"] = 2
+        cache.write_text(json.dumps(data, indent=2))
     return words
 
 
@@ -137,6 +182,12 @@ def align(sentences: list, words: list, threshold: float) -> tuple:
     wtokens = [norm_tokens(w["word"]) for w in words]
     wjoined = ["".join(t) for t in wtokens]  # full word, spaces stripped
     wtokens = [(t[0] if t else "") for t in wtokens]
+    MIN_TAIL = 0.15  # seconds of clean air needed after a take's last word
+
+    def tail_air(we: int) -> float:
+        if we + 1 >= len(words):
+            return float("inf")
+        return words[we + 1]["start"] - words[we]["end"]
 
     matches, warnings = [], []
     search_start = 0
@@ -146,51 +197,65 @@ def align(sentences: list, words: list, threshold: float) -> tuple:
             continue
         n = len(stoks)
         lengths = sorted({max(1, round(n * f)) for f in (0.8, 1.0, 1.2)})
-        best = None  # (score, start, end)
         sm = difflib.SequenceMatcher(autojunk=False)
         sm.set_seq2(stoks)
-        for start in range(search_start, len(words)):
-            for length in lengths:
-                end = start + length
-                if end > len(words):
-                    continue
-                sm.set_seq1(wtokens[start:end])
-                if sm.real_quick_ratio() < threshold:
-                    continue
-                score = sm.ratio()
-                if best is None or score > best[0] + 0.02:
-                    best = (score, start, end - 1)
-                elif score >= threshold and score >= best[0] - 0.02:
-                    # near-tie at/above threshold: prefer the later take
-                    best = (score, start, end - 1)
-        if best and best[0] >= threshold:
-            # Refine boundaries: candidate windows come in quantized lengths, so
-            # they can clip a trailing phrase or swallow the next take's first
-            # word. Nudge each edge (+/-3 words) until the score stops improving.
-            # Scored at the character level so compound-word splits ("SkillsBuild"
-            # vs "skills build", "bootcamp" vs "boot camp") don't skew boundaries.
-            smc = difflib.SequenceMatcher(autojunk=False)
-            smc.set_seq2("".join(stoks))
+        smc = difflib.SequenceMatcher(autojunk=False)
+        smc.set_seq2("".join(stoks))
 
-            def char_score(s: int, e: int) -> float:
-                smc.set_seq1("".join(wjoined[s:e + 1]))
-                return smc.ratio()
+        def char_score(s: int, e: int) -> float:
+            smc.set_seq1("".join(wjoined[s:e + 1]))
+            return smc.ratio()
 
+        def search(from_idx: int):
+            """Best window at/after from_idx: coarse token scan, then char-level
+            boundary refinement (compound-word splits like "SkillsBuild" vs
+            "skills build" would skew token-level edges)."""
+            best = None  # (score, start, end)
+            for start in range(from_idx, len(words)):
+                for length in lengths:
+                    end = start + length
+                    if end > len(words):
+                        continue
+                    sm.set_seq1(wtokens[start:end])
+                    if sm.real_quick_ratio() < threshold:
+                        continue
+                    score = sm.ratio()
+                    if best is None or score > best[0] + 0.02:
+                        best = (score, start, end - 1)
+                    elif score >= threshold and score >= best[0] - 0.02:
+                        # near-tie at/above threshold: prefer the later take
+                        best = (score, start, end - 1)
+            if best is None or best[0] < threshold:
+                return best
             best = (char_score(best[1], best[2]), best[1], best[2])
             improved = True
             while improved:
                 improved = False
-                score, ws, we = best
+                _, ws, we = best
                 for ds in range(-3, 4):
                     for de in range(-3, 4):
                         s2, e2 = ws + ds, we + de
-                        if s2 < search_start or e2 >= len(words) or e2 < s2:
+                        if s2 < from_idx or e2 >= len(words) or e2 < s2:
                             continue
                         cs = char_score(s2, e2)
                         if cs > best[0] + 1e-9:
                             best = (cs, s2, e2)
                             improved = True
+            return best
+
+        best = search(search_start)
+        if best and best[0] >= threshold:
             score, ws, we = best
+            if tail_air(we) < MIN_TAIL:
+                # The speaker restarted right on top of this take's last word,
+                # so no cut point can keep the word intact. A later take that
+                # ends into clean air beats a slightly better-worded one.
+                alt = search(we + 1)
+                if alt and alt[0] >= max(threshold, score - 0.2) \
+                        and tail_air(alt[2]) >= MIN_TAIL:
+                    print(f"      note: best take of \"{sent[:50]}\" has no clean "
+                          f"ending; using a later take (score {alt[0]:.2f})")
+                    score, ws, we = alt
             matches.append(Match(sent, score, ws, we, words[ws]["start"], words[we]["end"]))
             search_start = we + 1
         else:
@@ -199,27 +264,61 @@ def align(sentences: list, words: list, threshold: float) -> tuple:
     return matches, warnings
 
 
-def build_segments(matches: list, words: list, pad_pre: float, pad_post: float,
+def build_segments(matches: list, words: list, video: Path,
+                   pad_pre: float, pad_post: float,
                    merge_gap: float, max_pause: float, duration: float) -> list:
     # Split each matched sentence at internal silences longer than max_pause
     # (reading pauses, breaths) so dead air inside a take gets cut too.
-    spans = []  # (first_word_index, last_word_index)
+    wnorm = ["".join(norm_tokens(w["word"])) for w in words]
+    spans = []  # [first_word_index, last_word_index]
     for m in matches:
+        mspans = []
         run_start = m.wstart
         for i in range(m.wstart, m.wend):
             if words[i + 1]["start"] - words[i]["end"] > max_pause:
-                spans.append((run_start, i))
+                mspans.append([run_start, i])
                 run_start = i + 1
-        spans.append((run_start, m.wend))
+        mspans.append([run_start, m.wend])
+        # Stutter removal: if the last words of a sub-span are re-spoken at the
+        # start of the next one ("you can even | can even learn..."), the first
+        # occurrence is a false start — trim it so the line isn't repeated.
+        for a, b in zip(mspans, mspans[1:]):
+            maxk = min(a[1] - a[0] + 1, b[1] - b[0] + 1)
+            for k in range(maxk, 1, -1):
+                if wnorm[a[1] - k + 1:a[1] + 1] == wnorm[b[0]:b[0] + k]:
+                    a[1] -= k
+                    break
+        # ASR sometimes silently drops a stuttered restart, leaving speech the
+        # word list doesn't know about inside a "pause". Check the pause audio:
+        # if speech energy runs continuously into the next sub-span, snap that
+        # span's start back to the true silence boundary (so no utterance is
+        # entered mid-word), and drop a short earlier sub-span as a false start.
+        mspans = [s + [None] for s in mspans if s[1] >= s[0]]  # [i0, i1, t0_override]
+        dropped = set()
+        for idx, (a, b) in enumerate(zip(mspans, mspans[1:])):
+            g0, g1 = words[a[1]]["end"] + 0.05, words[b[0]]["start"]
+            if g1 - g0 < 0.8:
+                continue
+            iv = speech_intervals(video, g0, g1)
+            if iv and iv[-1][1] >= g1 - 0.25:  # hidden speech leads into b
+                b[2] = max(g0, iv[-1][0] - 0.05)
+                if a[1] - a[0] + 1 <= 4:
+                    dropped.add(idx)
+                    print(f"      note: dropping false start before "
+                          f"{words[b[0]]['start']:.2f}s (hidden retake in pause)")
+        spans.extend(s for i, s in enumerate(mspans) if i not in dropped)
 
     segs = []
-    for i0, i1 in spans:
+    for i0, i1, t0_override in spans:
         # Pad, but never into a neighboring word — that's how a false start
         # ("next we ha-") bleeds into the end of the previous cut.
-        t0 = words[i0]["start"] - pad_pre
-        if i0 > 0:
-            t0 = max(t0, words[i0 - 1]["end"] + 0.05)
-        t0 = max(0.0, min(t0, words[i0]["start"]))
+        if t0_override is not None:
+            t0 = t0_override
+        else:
+            t0 = words[i0]["start"] - pad_pre
+            if i0 > 0:
+                t0 = max(t0, words[i0 - 1]["end"] + 0.05)
+            t0 = max(0.0, min(t0, words[i0]["start"]))
         t1 = words[i1]["end"] + pad_post
         if i1 + 1 < len(words):
             t1 = min(t1, words[i1 + 1]["start"] - 0.05)
@@ -229,6 +328,27 @@ def build_segments(matches: list, words: list, pad_pre: float, pad_post: float,
         else:
             segs.append([t0, t1])
     return segs
+
+
+def speech_intervals(video: Path, t0: float, t1: float) -> list:
+    """Actual speech spans (by audio energy) inside [t0, t1] of the video."""
+    proc = subprocess.run(
+        ["ffmpeg", "-ss", f"{t0:.3f}", "-to", f"{t1:.3f}", "-i", str(video),
+         "-vn", "-af", "silencedetect=noise=-35dB:d=0.25", "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    intervals, cur = [], t0
+    for kind, val in re.findall(r"silence_(start|end): ([0-9.]+)", proc.stderr):
+        t = t0 + float(val)
+        if kind == "start":
+            if cur is not None and t - cur >= 0.15:
+                intervals.append((cur, t))
+            cur = None
+        else:
+            cur = t
+    if cur is not None and t1 - cur >= 0.15:
+        intervals.append((cur, t1))
+    return intervals
 
 
 # --------------------------------------------------------------------- cutting
@@ -320,7 +440,7 @@ def main() -> None:
     for m in matches:
         print(f"{m.score:6.2f}  {fmt_t(m.t0):>9}  {fmt_t(m.t1):>9}  {m.sentence[:70]}")
 
-    segs = build_segments(matches, words, args.pad_pre, args.pad_post,
+    segs = build_segments(matches, words, args.video, args.pad_pre, args.pad_post,
                           args.merge_gap, args.max_pause, duration)
     kept = sum(t1 - t0 for t0, t1 in segs)
     print(f"\n{len(matches)}/{len(sentences)} sentences matched -> {len(segs)} segment(s), "
