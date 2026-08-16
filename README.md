@@ -39,9 +39,11 @@ contain, in order.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--threshold` | 0.8 | Minimum fuzzy-match score (0–1) for a sentence to be kept |
-| `--pad-pre` | 0.15 | Seconds kept before each matched sentence |
-| `--pad-post` | 0.25 | Seconds kept after each matched sentence |
-| `--merge-gap` | 0.3 | Segments closer than this (seconds) are merged into one |
+| `--pad-pre` | 0.05 | Seconds kept before each matched sentence |
+| `--pad-post` | 0.12 | Seconds kept after each matched sentence |
+| `--merge-gap` | 0.15 | Segments closer than this (seconds) are merged into one |
+| `--max-pause` | 0.35 | Silences inside a sentence longer than this are cut out |
+| `--no-verify` | off | Skip the QC pass |
 | `--work-dir` | `work/` | Where audio, transcript cache, and cut artifacts go |
 
 ## How it works
@@ -56,6 +58,14 @@ contain, in order.
    the last read of a flubbed line is usually the keeper. Unmatched sentences
    are warned about and skipped.
 4. **Cut & join** — each matched span (plus padding) is re-encoded for
-   frame-accurate cuts, then concatenated into the output.
+   frame-accurate cuts, then concatenated into the output. Cut boundaries are
+   snapped to measured speech energy: heads skip breaths (loud but brief),
+   tails keep soft word endings, and pauses hiding un-transcribed retakes are
+   detected and cut around.
+5. **Verify** — the rendered cut is itself transcribed and diffed against the
+   script. You get a fidelity score and a timestamped list of anything that
+   differs (missing phrases, delivery deviations, suspect boundaries), saved
+   to `work/verify.json`. This catches what input-side analysis can't — a
+   clipped word at a cut point is audible in the output, not the input.
 
 Inspect `work/cuts.json` to see exactly what was matched and where.
