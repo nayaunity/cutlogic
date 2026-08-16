@@ -323,6 +323,30 @@ def build_segments(matches: list, words: list, video: Path,
         if i1 + 1 < len(words):
             t1 = min(t1, words[i1 + 1]["start"] - 0.05)
         t1 = min(duration, max(t1, words[i1]["end"]))
+        # ASR word timestamps absorb breaths and voice decay, leaving hidden
+        # air inside the cut. The two edges need different treatment:
+        # - Heads: the inhale before speech can be as loud as quiet speech, so
+        #   no energy floor separates them — but duration does. Breaths are
+        #   sub-0.15s bursts; voice comes in sustained runs. Snap the head to
+        #   the last substantial voiced run (voice-level threshold, chained
+        #   across stop-consonant closures), margin for soft onset consonants.
+        # - Tails: soft word endings (trailing sibilants, decay) sit far below
+        #   voice level, so use the sensitive threshold there; post-speech
+        #   breath is separated from the word by registering silence.
+        iv = speech_intervals(video, t0, min(t1, words[i0]["end"] + 0.1),
+                              noise="-16dB", min_silence=0.05)
+        runs = []
+        for s, e in iv:
+            if runs and s - runs[-1][1] <= 0.09:
+                runs[-1][1] = e
+            else:
+                runs.append([s, e])
+        if runs:
+            t0 = max(t0, runs[-1][0] - pad_pre - 0.10)
+        iv = speech_intervals(video, max(t0, words[i1]["start"] - 0.1), t1,
+                              noise="-27dB", min_silence=0.12)
+        if iv:
+            t1 = max(min(t1, iv[-1][1] + pad_post), t0 + 0.1)
         if segs and t0 - segs[-1][1] <= merge_gap:
             segs[-1][1] = max(segs[-1][1], t1)
         else:
@@ -330,11 +354,17 @@ def build_segments(matches: list, words: list, video: Path,
     return segs
 
 
-def speech_intervals(video: Path, t0: float, t1: float) -> list:
-    """Actual speech spans (by audio energy) inside [t0, t1] of the video."""
+def speech_intervals(video: Path, t0: float, t1: float,
+                     noise: str = "-35dB", min_silence: float = 0.25) -> list:
+    """Actual speech spans (by audio energy) inside [t0, t1] of the video.
+
+    The default -35dB floor is paranoid (quiet mumbles count as speech) —
+    right for detecting hidden retakes. Boundary tightening passes -27dB so
+    breaths and room noise count as silence and get cut through.
+    """
     proc = subprocess.run(
         ["ffmpeg", "-ss", f"{t0:.3f}", "-to", f"{t1:.3f}", "-i", str(video),
-         "-vn", "-af", "silencedetect=noise=-35dB:d=0.25", "-f", "null", "-"],
+         "-vn", "-af", f"silencedetect=noise={noise}:d={min_silence}", "-f", "null", "-"],
         capture_output=True, text=True,
     )
     intervals, cur = [], t0
