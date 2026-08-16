@@ -135,6 +135,7 @@ def align(sentences: list, words: list, threshold: float) -> tuple:
     flubbed line is usually the keeper.
     """
     wtokens = [norm_tokens(w["word"]) for w in words]
+    wjoined = ["".join(t) for t in wtokens]  # full word, spaces stripped
     wtokens = [(t[0] if t else "") for t in wtokens]
 
     matches, warnings = [], []
@@ -163,6 +164,32 @@ def align(sentences: list, words: list, threshold: float) -> tuple:
                     # near-tie at/above threshold: prefer the later take
                     best = (score, start, end - 1)
         if best and best[0] >= threshold:
+            # Refine boundaries: candidate windows come in quantized lengths, so
+            # they can clip a trailing phrase or swallow the next take's first
+            # word. Nudge each edge (+/-3 words) until the score stops improving.
+            # Scored at the character level so compound-word splits ("SkillsBuild"
+            # vs "skills build", "bootcamp" vs "boot camp") don't skew boundaries.
+            smc = difflib.SequenceMatcher(autojunk=False)
+            smc.set_seq2("".join(stoks))
+
+            def char_score(s: int, e: int) -> float:
+                smc.set_seq1("".join(wjoined[s:e + 1]))
+                return smc.ratio()
+
+            best = (char_score(best[1], best[2]), best[1], best[2])
+            improved = True
+            while improved:
+                improved = False
+                score, ws, we = best
+                for ds in range(-3, 4):
+                    for de in range(-3, 4):
+                        s2, e2 = ws + ds, we + de
+                        if s2 < search_start or e2 >= len(words) or e2 < s2:
+                            continue
+                        cs = char_score(s2, e2)
+                        if cs > best[0] + 1e-9:
+                            best = (cs, s2, e2)
+                            improved = True
             score, ws, we = best
             matches.append(Match(sent, score, ws, we, words[ws]["start"], words[we]["end"]))
             search_start = we + 1
@@ -176,19 +203,27 @@ def build_segments(matches: list, words: list, pad_pre: float, pad_post: float,
                    merge_gap: float, max_pause: float, duration: float) -> list:
     # Split each matched sentence at internal silences longer than max_pause
     # (reading pauses, breaths) so dead air inside a take gets cut too.
-    spans = []
+    spans = []  # (first_word_index, last_word_index)
     for m in matches:
         run_start = m.wstart
         for i in range(m.wstart, m.wend):
             if words[i + 1]["start"] - words[i]["end"] > max_pause:
-                spans.append((words[run_start]["start"], words[i]["end"]))
+                spans.append((run_start, i))
                 run_start = i + 1
-        spans.append((words[run_start]["start"], words[m.wend]["end"]))
+        spans.append((run_start, m.wend))
 
     segs = []
-    for t0, t1 in spans:
-        t0 = max(0.0, t0 - pad_pre)
-        t1 = min(duration, t1 + pad_post)
+    for i0, i1 in spans:
+        # Pad, but never into a neighboring word — that's how a false start
+        # ("next we ha-") bleeds into the end of the previous cut.
+        t0 = words[i0]["start"] - pad_pre
+        if i0 > 0:
+            t0 = max(t0, words[i0 - 1]["end"] + 0.05)
+        t0 = max(0.0, min(t0, words[i0]["start"]))
+        t1 = words[i1]["end"] + pad_post
+        if i1 + 1 < len(words):
+            t1 = min(t1, words[i1 + 1]["start"] - 0.05)
+        t1 = min(duration, max(t1, words[i1]["end"]))
         if segs and t0 - segs[-1][1] <= merge_gap:
             segs[-1][1] = max(segs[-1][1], t1)
         else:
