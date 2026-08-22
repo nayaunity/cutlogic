@@ -173,11 +173,37 @@ _CONTRACTIONS = {
 }
 
 
+_ONES = ("zero one two three four five six seven eight nine ten eleven twelve "
+         "thirteen fourteen fifteen sixteen seventeen eighteen nineteen").split()
+_TENS = "zero ten twenty thirty forty fifty sixty seventy eighty ninety".split()
+
+
+def _num_words(n: int) -> list:
+    if n < 20:
+        return [_ONES[n]]
+    if n < 100:
+        return [_TENS[n // 10]] + (_num_words(n % 10) if n % 10 else [])
+    if n < 1000:
+        return [_ONES[n // 100], "hundred"] + (_num_words(n % 100) if n % 100 else [])
+    if n < 1_000_000:
+        return _num_words(n // 1000) + ["thousand"] + (_num_words(n % 1000) if n % 1000 else [])
+    return [str(n)]
+
+
 def norm_tokens(text: str) -> list:
-    toks = _norm_re.sub(" ", text.lower()).split()
+    # "$400,000" -> "400000"; scripts write digits, speakers say words —
+    # normalize both sides to words so "90 days" matches "ninety days".
+    text = re.sub(r"(?<=\d),(?=\d)", "", text.lower())
     out = []
-    for t in toks:
-        out.extend(_CONTRACTIONS.get(t, t).split())
+    for t in _norm_re.sub(" ", text).split():
+        if t.isdigit():
+            out.extend(_num_words(int(t)))
+        elif re.fullmatch(r"\d+k", t):
+            out.extend(_num_words(int(t[:-1]) * 1000))
+        elif t == "k":
+            out.append("thousand")
+        else:
+            out.extend(_CONTRACTIONS.get(t, t).split())
     return out
 
 
@@ -194,9 +220,11 @@ class Match:
     wend: int    # inclusive
     t0: float
     t1: float
+    low: bool = False  # accepted below threshold (delivery deviates); review
 
 
-def align(sentences: list, words: list, threshold: float) -> tuple:
+def align(sentences: list, words: list, threshold: float,
+          min_score: float = 0.45) -> tuple:
     """Monotonically match each sentence to the best transcript window.
 
     Among near-equal matches, prefers the later one — the last take of a
@@ -212,7 +240,8 @@ def align(sentences: list, words: list, threshold: float) -> tuple:
             return float("inf")
         return words[we + 1]["start"] - words[we]["end"]
 
-    def search(stoks: list, from_idx: int, prefer_later: bool = True):
+    def search(stoks: list, from_idx: int, prefer_later: bool = True,
+               until: int = None):
         """Best window at/after from_idx: coarse token scan, then char-level
         boundary refinement (compound-word splits like "SkillsBuild" vs
         "skills build" would skew token-level edges)."""
@@ -228,7 +257,7 @@ def align(sentences: list, words: list, threshold: float) -> tuple:
             return smc.ratio()
 
         best = None  # (score, start, end)
-        for start in range(from_idx, len(words)):
+        for start in range(from_idx, min(len(words), until or len(words))):
             for length in lengths:
                 end = start + length
                 if end > len(words):
@@ -261,12 +290,12 @@ def align(sentences: list, words: list, threshold: float) -> tuple:
         return best
 
     def search_clean_tail(stoks: list, from_idx: int, label: str,
-                          prefer_later: bool = True):
+                          prefer_later: bool = True, until: int = None):
         """search(), then swap to a later take if the best one's last word has
         a restart on top of it — no cut point could keep that word intact."""
-        best = search(stoks, from_idx, prefer_later)
+        best = search(stoks, from_idx, prefer_later, until)
         if best and best[0] >= threshold and tail_air(best[2]) < MIN_TAIL:
-            alt = search(stoks, best[2] + 1, prefer_later)
+            alt = search(stoks, best[2] + 1, prefer_later, until)
             if alt and alt[0] >= max(threshold, best[0] - 0.2) \
                     and tail_air(alt[2]) >= MIN_TAIL:
                 print(f"      note: best take of \"{label[:50]}\" has no clean "
@@ -285,22 +314,41 @@ def align(sentences: list, words: list, threshold: float) -> tuple:
         # A weak whole-sentence match usually means no single take contains
         # the full line. The script's commas mark where splicing is legal:
         # retry clause by clause, each clause matched to its own best take.
-        if "," in sent and (best is None or best[0] < 0.9):
+        if best is None or best[0] < 0.97:
+            parts = [p.strip() for p in sent.split(",") if p.strip()]
+            if len(parts) < 2:
+                # No commas — split before conjunctions and clause markers;
+                # retakes restart there ("...like a startup / and I just
+                # realized...", "followed by Wisprflow / where he talks out...").
+                parts = [p.strip() for p in
+                         re.split(r"\s+(?=(?:and|but|or|so|because|where|when|while|then)\s)",
+                                  sent) if p.strip()]
             clauses, cur = [], ""
-            for part in sent.split(","):
-                cur = f"{cur},{part}" if cur else part
+            for part in parts:
+                cur = f"{cur} {part}".strip() if cur else part
                 if len(norm_tokens(cur)) >= 3:
-                    clauses.append(cur.strip())
+                    clauses.append(cur)
                     cur = ""
             if cur and clauses:
-                clauses[-1] = f"{clauses[-1]},{cur}".strip()
+                clauses[-1] = f"{clauses[-1]} {cur}".strip()
+            # Pieces of one sentence live near the whole-sentence match —
+            # bound their search to that neighborhood, not the full video.
+            bound = (best[2] + 60) if best else None
+
             def try_pieces(prefer_later: bool):
                 # A greedy later-take chain can trap later clauses on flubbed
                 # takes; the earlier-take chain sometimes completes instead.
                 out, pos = [], search_start
-                for clause in clauses:
-                    b = search_clean_tail(norm_tokens(clause), pos, clause,
-                                          prefer_later)
+                for i, clause in enumerate(clauses):
+                    # Mid-sentence seams are expected to abut the next word,
+                    # so the clean-tail take swap only applies to the last
+                    # clause; phonetic tail rules handle interior boundaries.
+                    if i == len(clauses) - 1:
+                        b = search_clean_tail(norm_tokens(clause), pos, clause,
+                                              prefer_later, until=bound)
+                    else:
+                        b = search(norm_tokens(clause), pos, prefer_later,
+                                   until=bound)
                     if not b or b[0] < threshold:
                         return None
                     out.append((clause, b))
@@ -339,6 +387,16 @@ def align(sentences: list, words: list, threshold: float) -> tuple:
                                      words[ws]["start"], words[we]["end"]))
                 # search_start intentionally not moved: the cursor tracks the
                 # forward pass; a reused take is out-of-order by design.
+            elif best and best[0] >= min_score:
+                # Imperfect scripts are normal in production: a mid-score match
+                # is usually the right take delivered in different words.
+                # Keep it, marked for review, rather than silently dropping
+                # the line from the video.
+                score, ws, we = best
+                matches.append(Match(sent, score, ws, we,
+                                     words[ws]["start"], words[we]["end"],
+                                     low=True))
+                search_start = we + 1
             else:
                 got = f"best score {best[0]:.2f}" if best else "no candidate"
                 warnings.append(f"unmatched (skipped): \"{sent[:60]}\" ({got})")
@@ -364,8 +422,11 @@ def build_segments(matches: list, words: list, video: Path,
         # start of the next one ("you can even | can even learn..."), the first
         # occurrence is a false start — trim it so the line isn't repeated.
         for a, b in zip(mspans, mspans[1:]):
+            # k=1 included: a single word repeated across a pause-split
+            # ("I- ... I had") is a restart, not deliberate repetition —
+            # deliberate doubles have no pause and never get split.
             maxk = min(a[1] - a[0] + 1, b[1] - b[0] + 1)
-            for k in range(maxk, 1, -1):
+            for k in range(maxk, 0, -1):
                 if wnorm[a[1] - k + 1:a[1] + 1] == wnorm[b[0]:b[0] + k]:
                     a[1] -= k
                     break
@@ -423,13 +484,18 @@ def build_segments(matches: list, words: list, video: Path,
             onset = max(t0, runs[0][0] - pad_pre - 0.10)
             w0s, w0e = words[i0]["start"], words[i0]["end"]
             if onset > w0s + 0.02 and \
-                    mean_volume(video, w0s, min(w0e, onset)) > -30.0:
+                    mean_volume(video, w0s, min(w0e, onset)) > SPEECH_LEVEL - 11:
                 # The first word's span has real audio — it's a quiet short
                 # word ("a", "the"), not an absorbed breath. Don't skip it.
                 onset = max(t0, w0s - pad_pre)
             t0 = onset
         iv = speech_intervals(video, max(t0, words[i1]["start"] - 0.1), t1,
-                              noise="-27dB", min_silence=0.12)
+                              noise=thr_soft(), min_silence=0.12)
+        if not iv:
+            # No audible speech near the claimed last word — its ASR span sits
+            # in dead air. Search the whole segment for the true last speech.
+            iv = speech_intervals(video, t0, t1, noise=thr_soft(),
+                                  min_silence=0.12)
         last = "".join(norm_tokens(words[i1]["word"]))
         if iv:
             snapped = min(t1, iv[-1][1] + pad_post)
@@ -441,18 +507,43 @@ def build_segments(matches: list, words: list, video: Path,
                 snapped = max(snapped,
                               min(iv[-1][1] + 0.2, words[i1]["end"] + 0.05, t1))
             elif last[-1:] in "sz":
-                # Trailing sibilants drag on; cut slightly into the "s"
-                # instead of padding after it — snappy pacing.
-                snapped = min(snapped, max(iv[-1][1] - 0.06, t0 + 0.1))
+                # Trailing sibilants drag on; cut right at the sibilant's end
+                # instead of padding after it — snappy pacing, "s" still lands.
+                snapped = min(snapped, max(iv[-1][1] + 0.02, t0 + 0.1))
             t1 = max(snapped, t0 + 0.1)
         if last[-1:] in "sz":
-            t1 = max(min(t1, words[i1]["end"] + 0.02), t0 + 0.1)
+            t1 = max(min(t1, words[i1]["end"] + 0.05), t0 + 0.1)
         # Merge only forward-adjacent spans; a reused earlier take jumps
         # backward in source time and must stay its own segment.
         if segs and t0 >= segs[-1][0] and t0 - segs[-1][1] <= merge_gap:
             segs[-1][1] = max(segs[-1][1], t1)
         else:
             segs.append([t0, t1])
+
+    # Anti-jitter: halting delivery produces runs of sub-second segments —
+    # four cuts in two seconds reads as flicker. Merge shots shorter than
+    # MIN_SHOT into a neighbor when the pause between them is small enough
+    # to keep; a beat of natural pause beats machine-gun cuts.
+    MIN_SHOT, KEEPABLE_GAP = 0.8, 0.7
+    changed = True
+    while changed:
+        changed = False
+        for i, seg in enumerate(segs):
+            if seg[1] - seg[0] >= MIN_SHOT:
+                continue
+            cands = []
+            if i > 0 and 0 <= seg[0] - segs[i - 1][1] <= KEEPABLE_GAP:
+                cands.append((seg[0] - segs[i - 1][1], i - 1))
+            if i + 1 < len(segs) and 0 <= segs[i + 1][0] - seg[1] <= KEEPABLE_GAP:
+                cands.append((segs[i + 1][0] - seg[1], i + 1))
+            if not cands:
+                continue
+            _, j = min(cands)
+            a, b = (j, i) if j < i else (i, j)
+            segs[a][1] = segs[b][1]
+            del segs[b]
+            changed = True
+            break
     return segs
 
 
@@ -483,6 +574,34 @@ def speech_intervals(video: Path, t0: float, t1: float,
     return intervals
 
 
+# Recording levels vary wildly between videos (a lav mic vs a phone across the
+# room), so energy thresholds are relative to the measured speech level.
+# The defaults correspond to the ~-19dB reference the rules were tuned on.
+SPEECH_LEVEL = -19.0
+
+
+def thr_voice() -> str:
+    return f"{SPEECH_LEVEL + 3:.0f}dB"   # voiced speech only; breaths below
+
+
+def thr_soft() -> str:
+    return f"{SPEECH_LEVEL - 8:.0f}dB"   # soft tails, sibilants, decay
+
+
+def calibrate_speech_level(video: Path, words: list) -> None:
+    """Sample volume over ASR word spans to find this video's speech level."""
+    global SPEECH_LEVEL
+    cands = [w for w in words if w["end"] - w["start"] >= 0.25]
+    if not cands:
+        return
+    step = max(1, len(cands) // 12)
+    samples = sorted(mean_volume(video, w["start"], w["end"])
+                     for w in cands[::step][:12])
+    SPEECH_LEVEL = samples[len(samples) // 2]
+    print(f"      speech level ~{SPEECH_LEVEL:.0f} dB "
+          f"(voice threshold {thr_voice()}, soft {thr_soft()})")
+
+
 def mean_volume(video: Path, t0: float, t1: float) -> float:
     proc = subprocess.run(
         ["ffmpeg", "-ss", f"{t0:.3f}", "-to", f"{t1:.3f}", "-i", str(video),
@@ -500,7 +619,7 @@ def voiced_runs(video: Path, t0: float, t1: float) -> list:
     them; duration does. Detect at voice level (-16dB), chain across brief
     stop-consonant closures, and keep only sustained runs.
     """
-    iv = speech_intervals(video, t0, t1, noise="-16dB", min_silence=0.05)
+    iv = speech_intervals(video, t0, t1, noise=thr_voice(), min_silence=0.05)
     runs = []
     for s, e in iv:
         if runs and s - runs[-1][1] <= 0.09:
@@ -622,6 +741,8 @@ def main() -> None:
     ap.add_argument("-o", "--output", type=Path, default=Path("output.mp4"))
     ap.add_argument("--dry-run", action="store_true", help="print cut list, don't render")
     ap.add_argument("--threshold", type=float, default=0.8, help="match score cutoff (0-1)")
+    ap.add_argument("--min-score", type=float, default=0.45,
+                    help="floor for low-confidence matches; below this a line is skipped")
     ap.add_argument("--pad-pre", type=float, default=0.05, help="seconds kept before each match")
     ap.add_argument("--pad-post", type=float, default=0.12, help="seconds kept after each match")
     ap.add_argument("--merge-gap", type=float, default=0.15,
@@ -646,12 +767,13 @@ def main() -> None:
 
     audio = extract_audio(args.video, args.work_dir)
     words = transcribe(args.video, audio, args.work_dir, api_key)
+    calibrate_speech_level(args.video, words)
     duration = probe_duration(args.video)
     sentences = split_sentences(args.script.read_text())
     print(f"[3/5] aligning {len(sentences)} script sentence(s) "
           f"against {len(words)} transcript words...")
 
-    matches, warnings = align(sentences, words, args.threshold)
+    matches, warnings = align(sentences, words, args.threshold, args.min_score)
     for w in warnings:
         print(f"      warning: {w}")
     if not matches:
@@ -660,11 +782,16 @@ def main() -> None:
 
     print(f"\n{'score':>6}  {'start':>9}  {'end':>9}  sentence")
     for m in matches:
-        print(f"{m.score:6.2f}  {fmt_t(m.t0):>9}  {fmt_t(m.t1):>9}  {m.sentence[:70]}")
+        flag = "LOW" if m.low else "   "
+        print(f"{flag} {m.score:5.2f}  {fmt_t(m.t0):>9}  {fmt_t(m.t1):>9}  {m.sentence[:70]}")
 
     segs = build_segments(matches, words, args.video, args.pad_pre, args.pad_post,
                           args.merge_gap, args.max_pause, duration)
     kept = sum(t1 - t0 for t0, t1 in segs)
+    lows = [m for m in matches if m.low]
+    if lows:
+        print(f"\n{len(lows)} low-confidence line(s) — delivery likely deviates "
+              f"from the script there; review those timestamps")
     print(f"\n{len(matches)} take(s) matched for {len(sentences)} script sentence(s) "
           f"-> {len(segs)} segment(s), "
           f"keeping {fmt_t(kept)} of {fmt_t(duration)}")
@@ -673,7 +800,7 @@ def main() -> None:
     cuts_file.write_text(json.dumps({
         "video": str(args.video),
         "segments": [{"start": t0, "end": t1} for t0, t1 in segs],
-        "matches": [{"sentence": m.sentence, "score": round(m.score, 3),
+        "matches": [{"sentence": m.sentence, "score": round(m.score, 3), "low": m.low,
                      "start": m.t0, "end": m.t1} for m in matches],
         "warnings": warnings,
     }, indent=2))
