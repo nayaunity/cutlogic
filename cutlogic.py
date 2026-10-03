@@ -887,7 +887,87 @@ def render(video: Path, segs: list, work: Path, output: Path) -> None:
 
 # ---------------------------------------------------------------------- verify
 
-def verify(output: Path, script_text: str, work: Path, api_key: str) -> None:
+def check_edges(video: Path, segs: list, words: list, api_key: str,
+                probe: bool = True) -> list:
+    """Inspect every cut edge in the SOURCE audio.
+
+    The transcript diff in verify() hears the output, but it is blind to a
+    breath kept ahead of a line, a soft ending trimmed as silence, or speech
+    inside a "pause" the ASR mis-timed. These checks look at the audio on
+    either side of each edge instead. Returns (source_time, message) pairs.
+    """
+    issues = []
+    quiet = ROOM_DB + 8.0  # TAIL_DB floor: real voice, not room hum
+    for k, (t0, t1) in enumerate(segs):
+        inside = [w for w in words if w["end"] > t0 + 0.02 and w["start"] < t1]
+        if not inside:
+            continue
+        first, last = inside[0]["word"], inside[-1]["word"]
+        # Tail: voice still going right after the cut.
+        after = rms_windows(video, t1, t1 + 0.15, 0.05)
+        if after and max(after) > quiet:
+            issues.append((t1, f"voice continues after the cut ending \"{last}\" "
+                               f"({max(after):.0f} dB) — clipped ending?"))
+        # Removed gap between close segments: must be silence, not speech.
+        if k + 1 < len(segs) and 0 < segs[k + 1][0] - t1 < 1.0:
+            gap = rms_windows(video, t1, segs[k + 1][0], 0.05)
+            if gap and max(gap) > ROOM_DB + 8.0:
+                issues.append((t1, f"speech inside the removed gap after \"{last}\" "
+                                   f"({max(gap):.0f} dB)"))
+        # Head: breath kept ahead of the first word, or an attack cut into.
+        pre = level_windows(video, t0 - 0.06, t0, 0.02)
+        if len(pre) >= 2 and pre[-1][0] > ROOM_DB + 12.0 and pre[-1][1] < 0.2 \
+                and pre[-1][0] >= pre[0][0] + 3.0:
+            issues.append((t0, f"cut opens on rising voice before \"{first}\" — "
+                               f"clipped opener?"))
+        head = level_windows(video, t0, t0 + 0.4, 0.02)
+        vi = next((i for i, (r, z) in enumerate(head)
+                   if r >= SPEECH_DB - 2.0 and z < 0.2), len(head))
+        breath = [r for r, z in head[:vi]
+                  if ROOM_DB + 5.0 < r < SPEECH_DB - 2.0 and z < 0.25]
+        allow = 10 if first[:1].lower() in "mn" else 4  # nasal murmur is kept by design
+        if len(breath) > allow:
+            issues.append((t0, f"{len(breath) * 20}ms of breath-level audio before "
+                               f"\"{first}\""))
+    if probe:
+        # Transcribe the first 2.4s of each cut from the source, with 0.5s of
+        # silence prepended (bare short clips come back empty), and check
+        # the first word is heard. ASR confusions on function words are
+        # common, so a loose prefix match is used.
+        tmp = video.parent / ".cutlogic-probe.ogg"
+        for t0, t1 in segs:
+            inside = [w for w in words if w["end"] > t0 + 0.02 and w["start"] < t1]
+            if not inside:
+                continue
+            exp = "".join(norm_tokens(inside[0]["word"]))
+            heard = []
+            for _ in range(2):
+                subprocess.run(
+                    ["ffmpeg", "-v", "error", "-y", "-ss", f"{t0:.3f}", "-t", "2.4",
+                     "-i", str(video), "-vn", "-ac", "1", "-ar", "16000",
+                     "-af", "adelay=500", "-c:a", "libopus", "-b:a", "48k", str(tmp)],
+                    capture_output=True)
+                try:
+                    heard = ["".join(norm_tokens(w["word"]))
+                             for w in resp_words(deepgram_post(tmp.read_bytes(), api_key))]
+                except Exception:
+                    heard = []
+                if heard:
+                    break
+            ok = bool(heard) and (heard[0] == exp or heard[0][:3] == exp[:3]
+                                  or heard[0].startswith(exp)
+                                  or (len(heard) > 1 and heard[1] == exp))
+            if not ok:
+                issues.append((t0, f"opener \"{inside[0]['word']}\" heard as "
+                                   f"\"{' '.join(heard[:3])}\" — clipped, or an ASR confusion"))
+        if tmp.exists():
+            tmp.unlink()
+    return sorted(issues)
+
+
+def verify(output: Path, script_text: str, work: Path, api_key: str,
+           video: Path = None, segs: list = None, words_src: list = None,
+           probe: bool = True) -> None:
     """QC pass: transcribe the rendered cut and diff it against the script.
 
     Catches what input-side analysis can't — clipped words at cut boundaries,
@@ -939,9 +1019,19 @@ def verify(output: Path, script_text: str, work: Path, api_key: str) -> None:
               "imperfect, so not every flag is a real defect)")
     else:
         print("      no differences beyond spelling — cut matches the script")
+    edge_issues = []
+    if video is not None and segs and words_src:
+        print(f"      checking {len(segs)} cut edges in the source audio"
+              + (" and probing each opener..." if probe else "..."))
+        edge_issues = check_edges(video, segs, words_src, api_key, probe)
+        for at, msg in edge_issues:
+            print(f"      [source {fmt_t(at)}] {msg}")
+        if not edge_issues:
+            print("      cut edges clean: no breath kept, no clipped word, no speech in removed gaps")
     (work / f"{output.stem}.verify.json").write_text(json.dumps({
         "fidelity": round(fidelity, 4),
         "issues": [{"at": at, "issue": msg} for at, msg in issues],
+        "edge_issues": [{"source_at": at, "issue": msg} for at, msg in edge_issues],
         "transcript": " ".join(w["word"] for w in words),
     }, indent=2))
 
@@ -967,6 +1057,8 @@ def main() -> None:
     ap.add_argument("--max-pause", type=float, default=0.35,
                     help="cut silences inside a sentence longer than this many seconds")
     ap.add_argument("--work-dir", type=Path, default=Path("work"))
+    ap.add_argument("--no-probe", action="store_true",
+                    help="verify: skip transcribing each cut's opener (faster, fewer API calls)")
     ap.add_argument("--no-verify", action="store_true",
                     help="skip the QC pass (transcribe the render, diff against script)")
     args = ap.parse_args()
@@ -1024,7 +1116,8 @@ def main() -> None:
 
     render(args.video, segs, args.work_dir, args.output)
     if not args.no_verify:
-        verify(args.output, args.script.read_text(), args.work_dir, api_key)
+        verify(args.output, args.script.read_text(), args.work_dir, api_key,
+               video=args.video, segs=segs, words_src=words, probe=not args.no_probe)
     print(f"\ndone: {args.output}")
 
 

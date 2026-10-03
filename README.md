@@ -44,6 +44,7 @@ contain, in order.
 | `--merge-gap` | 0.15 | Segments closer than this (seconds) are merged into one |
 | `--max-pause` | 0.35 | Silences inside a sentence longer than this are cut out |
 | `--no-verify` | off | Skip the QC pass |
+| `--no-probe` | off | In the QC pass, skip transcribing each cut's opener (faster, fewer API calls) |
 | `--work-dir` | `work/` | Where audio, transcript cache, and cut artifacts go |
 
 ## How it works
@@ -67,7 +68,14 @@ contain, in order.
 5. **Verify** — the rendered cut is itself transcribed and diffed against the
    script. You get a fidelity score and a timestamped list of anything that
    differs (missing phrases, delivery deviations, suspect boundaries), saved
-   to `work/verify.json`. This catches what input-side analysis can't — a
-   clipped word at a cut point is audible in the output, not the input.
+   to `work/<output>.verify.json`. This catches what input-side analysis
+   can't — a clipped word at a cut point is audible in the output, not the
+   input. The transcript diff is deaf to some defects, though, so every cut
+   edge is also inspected in the source audio: voice still sounding right
+   after a cut (a trimmed ending), breath-level audio kept ahead of the
+   first word, a cut opening on a rising attack, speech inside a "pause"
+   the transcript mis-timed, and — unless `--no-probe` — a short
+   transcription of each cut's opener to confirm its first word is heard.
+   Flags are listed with their source timecodes.
 
 Inspect `work/cuts.json` to see exactly what was matched and where.
