@@ -61,7 +61,9 @@ contain, in order.
    frame-accurate cuts, then concatenated into the output. Cut boundaries are
    snapped to measured speech energy: heads skip breaths (loud but brief),
    tails keep soft word endings, and pauses hiding un-transcribed retakes are
-   detected and cut around.
+   detected and cut around. Energy thresholds are calibrated to the
+   recording's own speech level first, so a quiet phone recording (or a
+   presenter who drops her voice reading numbers) isn't trimmed as silence.
 5. **Verify** — the rendered cut is itself transcribed and diffed against the
    script. You get a fidelity score and a timestamped list of anything that
    differs (missing phrases, delivery deviations, suspect boundaries), saved
