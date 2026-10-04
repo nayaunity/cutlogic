@@ -28,6 +28,7 @@ API = os.environ.get("VECTCUT_API", "http://127.0.0.1:9001")
 CAPCUT_APP = Path("/Applications/CapCut.app")
 DRAFTS_DIR = Path.home() / "Movies/CapCut/User Data/Projects/com.lveditor.draft"
 US = 1_000_000  # CapCut stores times in microseconds
+PLACEHOLDER = __import__("re").compile(r"##_draftpath_placeholder_[^#]*_##")
 
 
 # ----------------------------------------------------------------- server
@@ -129,7 +130,10 @@ def install_into_capcut(draft_dir: Path, name: str, source: Path = None) -> Path
     shutil.move(str(draft_dir), str(dest))
 
     info_p = dest / "draft_info.json"
-    info = json.loads(info_p.read_text())
+    # VectCutAPI sometimes leaves its draft-folder placeholder in material
+    # paths ("##_draftpath_placeholder_<id>_##/assets/..."); resolve it to the
+    # installed folder before anything else looks at the paths.
+    info = json.loads(PLACEHOLDER.sub(str(dest), info_p.read_text()))
     draft_uuid = str(uuid.uuid4()).upper()
     info["id"] = draft_uuid
     info["name"] = name
@@ -225,6 +229,8 @@ def draft_info_files(dest: Path) -> list:
     draft refuses to open."""
     files = [dest / "draft_info.json", dest / "draft_info.json.bak"]
     files += sorted((dest / "Timelines").glob("*/draft_info.json"))
+    files += sorted((dest / "Timelines").glob("*/project.json"))  # newer CapCut builds also keep these
+    files += sorted((dest / "Timelines").glob("project.json"))
     return [f for f in files if f.exists()]
 
 
@@ -240,7 +246,7 @@ def repair_draft(dest: Path, source: Path = None) -> dict:
         raise RuntimeError(f"no draft_info.json under {dest}")
     # Prefer CapCut's own Timelines copy when present: it is the newest.
     base = next((f for f in files if "Timelines" in f.parts), files[0])
-    info = json.loads(base.read_text())
+    info = json.loads(PLACEHOLDER.sub(str(dest), base.read_text()))
     assets = {p.name: p for p in (dest / "assets").rglob("*") if p.is_file()}
     fixed = {"video": 0, "photo": 0, "audio": 0, "pool": 0}
     for m in info.get("materials", {}).get("videos", []):
