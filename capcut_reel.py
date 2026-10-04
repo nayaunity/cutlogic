@@ -38,7 +38,8 @@ Y_HOOK_1, Y_HOOK_2 = 0.66, 0.50
 Y_CAPTION = -0.30     # lower chest
 Y_CALLOUT = -0.52     # over the desk edge
 Y_BADGE, X_BADGE = 0.74, 0.42   # top-right, above the shoulder
-Y_POPUP, X_POPUP = -0.50, 0.34
+Y_POPUP, X_POPUP = 0.12, 0.60    # on the empty wall beside the head, clear of hair and captions; scale 1.0 = logo fitted to the full canvas
+POPUP_SCALE = 0.2                 # ~216 px on a 1080 canvas
 
 STOP = set("""a an the and or but so to of in on at for with from by as is are was were be been being it its this
 that these those i me my we our you your he she they them their his her him then than there here when where which
@@ -52,6 +53,77 @@ LOGOS = {  # spoken word -> asset file; the first two mentions get a pop-up, at 
     "gamma": "gamma.png", "linkedin": "linkedin.png", "linkedin's": "linkedin.png",
     "chatgpt": "chatgpt.png", "manychat": "manychat.png", "adweek": "adweek.png", "oxford": "oxford.png",
 }
+
+
+def prep_logos(src: Path, work: Path) -> Path:
+    """Copy the logo files with their flat white background knocked out.
+    CapCut composites photos as-is, so a favicon on a white square scaled
+    onto the footage reads as an app icon, not a logo. Flood-fills from the
+    border so white inside the mark survives. Returns the folder to use."""
+    out = work / "capcut" / "logos"
+    out.mkdir(parents=True, exist_ok=True)
+    try:
+        from PIL import Image
+    except ImportError:
+        print("warning: Pillow missing, logos used as-is (pip install pillow)", file=sys.stderr)
+        return src
+    for f in sorted(set(LOGOS.values())):
+        if not (src / f).exists():
+            continue
+        im = Image.open(src / f).convert("RGBA")
+        if im.getchannel("A").getextrema() != (255, 255):
+            im.save(out / f); continue  # already transparent somewhere
+        px, (w, h) = im.load(), im.size
+        seen, stack = set(), [(x, y) for x in range(w) for y in (0, h - 1)] + [(x, y) for y in range(h) for x in (0, w - 1)]
+        while stack:
+            x, y = stack.pop()
+            if (x, y) in seen or not (0 <= x < w and 0 <= y < h):
+                continue
+            r, g, b, _ = px[x, y]
+            if r > 235 and g > 235 and b > 235:
+                seen.add((x, y)); px[x, y] = (r, g, b, 0)
+                stack += [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
+        im.save(out / f)
+    return out
+
+
+def popup_sheet(video: Path, segs: list, popups: list, logos: Path, out: Path) -> None:
+    """Check our own work: composite each logo at its CapCut size and spot
+    onto the real frame it lands on, so placement is judged before CapCut
+    opens. popups = [(output_time, file, side)]."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return
+    import subprocess
+    tiles = []
+    for t, f, side in popups[:8]:
+        src_t, cursor = None, 0.0
+        for s, e in segs:  # map the output time back to the source footage
+            if cursor <= t < cursor + (e - s):
+                src_t = s + (t - cursor); break
+            cursor += e - s
+        if src_t is None:
+            continue
+        frame = out.parent / f"{out.stem}-frame.png"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{src_t + 0.6:.3f}", "-i", str(video), "-frames:v", "1",
+                        "-vf", f"scale={CANVAS[0]}:{CANVAS[1]}", str(frame)], check=False)
+        if not frame.exists():
+            continue
+        fr = Image.open(frame).convert("RGBA"); lg = Image.open(logos / f).convert("RGBA")
+        lg.thumbnail((int(CANVAS[0] * POPUP_SCALE), int(CANVAS[0] * POPUP_SCALE)))
+        cx = int(CANVAS[0] / 2 + (-1 if side == "left" else 1) * X_POPUP * CANVAS[0] / 2)
+        cy = int(CANVAS[1] / 2 - Y_POPUP * CANVAS[1] / 2)
+        fr.alpha_composite(lg, (cx - lg.width // 2, cy - lg.height // 2))
+        tiles.append(fr.resize((CANVAS[0] // 4, CANVAS[1] // 4)))
+        frame.unlink()
+    if not tiles:
+        return
+    sheet = Image.new("RGB", (len(tiles) * (CANVAS[0] // 4 + 8), CANVAS[1] // 4), (30, 30, 30))
+    for i, tile in enumerate(tiles):
+        sheet.paste(tile, (i * (CANVAS[0] // 4 + 8), 0), tile)
+    sheet.save(out, quality=85)
+    print(f"pop-up placement sheet -> {out}")
 
 
 def norm(t):
@@ -133,7 +205,8 @@ def main():
 
         # 2. per sentence: keyword, figures, captions
         sents = sentences(words)
-        keywords, figures, punch_times, pop_times = [], [], [], []
+        keywords, figures, punch_times, pop_times, popups = [], [], [], [], []
+        logos = prep_logos(a.logos, a.work)
         chunks = []  # (text, start, end, style)
         for sent in sents:
             kw = pick_keyword(sent)
@@ -197,12 +270,13 @@ def main():
             key = norm(w["text"]).strip("'")
             key = key[:-2] if key.endswith("'s") else key
             f = LOGOS.get(key)
-            if not f or not (a.logos / f).exists(): continue
+            if not f or not (logos / f).exists(): continue
             if w["start"] - last_logo.get(f, -99) < 20: continue
             if any(abs(w["start"] - t0) < 6 for t0 in last_logo.values()): continue
             st, en = off_joins(w["start"], w["start"] + 2.5)
-            post("/add_image", {"image_url": str((a.logos / f).resolve()), "start": st, "end": en, "transform_y": Y_POPUP,
-                                "transform_x": -X_POPUP if side == "left" else X_POPUP, "scale_x": 0.9, "scale_y": 0.9,
+            popups.append((st, f, side))
+            post("/add_image", {"image_url": str((logos / f).resolve()), "start": st, "end": en, "transform_y": Y_POPUP,
+                                "transform_x": -X_POPUP if side == "left" else X_POPUP, "scale_x": POPUP_SCALE, "scale_y": POPUP_SCALE,
                                 "track_name": "image_popups", "intro_animation": "Slide_Right" if side == "left" else "Slide_Left",
                                 "intro_animation_duration": 0.4, "outro_animation": "Fade_Out", "outro_animation_duration": 0.3})
             last_logo[f] = w["start"]; side = "right" if side == "left" else "left"; n["popups"] += 1; pop_times.append(st)
@@ -284,6 +358,7 @@ def main():
             proc.terminate()
 
     dest = ch.install_into_capcut(draft_dir, a.name, source=video)
+    popup_sheet(video, segs, popups, logos, a.work / f"{a.name}-popups.jpg")
     ch.open_capcut(dest)
     print(json.dumps(n), f"\ndraft \"{a.name}\" -> {dest}")
 

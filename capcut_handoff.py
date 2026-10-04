@@ -142,13 +142,19 @@ def install_into_capcut(draft_dir: Path, name: str, source: Path = None) -> Path
         p = m.get("path") or ""
         if str(draft_dir) in p:
             moved = Path(p.replace(str(draft_dir), str(dest)))
-            if source is not None and source.exists():
+            is_clip = m.get("type") == "video"  # photos (logo pop-ups) stay as their moved copies
+            if is_clip and source is not None and source.exists():
                 m["path"] = str(source.resolve())
                 m["material_name"] = source.name
                 if moved.exists():
                     moved.unlink()
             else:
                 m["path"] = str(moved)
+    # Audio (sound cues) copies move with the folder too: repoint them.
+    for m in info.get("materials", {}).get("audios", []):
+        p = m.get("path") or ""
+        if str(draft_dir) in p:
+            m["path"] = p.replace(str(draft_dir), str(dest))
     info_p.write_text(json.dumps(info, ensure_ascii=False))
     (dest / "draft_info.json.bak").write_text(json.dumps(info, ensure_ascii=False))
 
@@ -194,6 +200,82 @@ def open_capcut(dest: Path) -> None:
     subprocess.run(["open", "-a", "CapCut"], check=False)
 
 
+def capcut_running() -> bool:
+    return subprocess.run(["pgrep", "-x", "CapCut"], capture_output=True).returncode == 0
+
+
+def quit_capcut(timeout: float = 20) -> bool:
+    """Ask CapCut to quit and wait for it; CapCut saves an open project on
+    quit and overwrites any draft file we patched while it was open."""
+    if not capcut_running():
+        return True
+    subprocess.run(["osascript", "-e", 'tell application "CapCut" to quit'],
+                   capture_output=True)
+    for _ in range(int(timeout / 0.5)):
+        if not capcut_running():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def draft_info_files(dest: Path) -> list:
+    """Every copy of the timeline CapCut may read. CapCut 175+ migrates a
+    draft on first open into Timelines/<id>/draft_info.json and rewrites the
+    top-level file with the same id; the copies must stay identical or the
+    draft refuses to open."""
+    files = [dest / "draft_info.json", dest / "draft_info.json.bak"]
+    files += sorted((dest / "Timelines").glob("*/draft_info.json"))
+    return [f for f in files if f.exists()]
+
+
+def repair_draft(dest: Path, source: Path = None) -> dict:
+    """Repoint every material in an installed draft to media that exists:
+    video clips at the source footage, photos and audio at the copies in
+    the draft's assets/ folder. Also fixes CapCut's media-pool list in
+    draft_meta_info.json. Refuses while CapCut runs (it would overwrite)."""
+    if capcut_running():
+        raise RuntimeError("quit CapCut first: it rewrites the draft on close")
+    files = draft_info_files(dest)
+    if not files:
+        raise RuntimeError(f"no draft_info.json under {dest}")
+    # Prefer CapCut's own Timelines copy when present: it is the newest.
+    base = next((f for f in files if "Timelines" in f.parts), files[0])
+    info = json.loads(base.read_text())
+    assets = {p.name: p for p in (dest / "assets").rglob("*") if p.is_file()}
+    fixed = {"video": 0, "photo": 0, "audio": 0, "pool": 0}
+    for m in info.get("materials", {}).get("videos", []):
+        p = Path(m.get("path") or "")
+        if m.get("type") == "video":
+            if source is not None and source.exists() and p != source.resolve():
+                m["path"], m["material_name"] = str(source.resolve()), source.name
+                fixed["video"] += 1
+        elif not p.exists() or p.suffix.lower() in (".mov", ".mp4"):
+            cand = assets.get(m.get("material_name") or p.name)
+            if cand is None:
+                pngs = [v for k, v in assets.items() if k.endswith(".png")]
+                cand = pngs[0] if len(pngs) == 1 else None
+            if cand is not None:
+                m["path"], m["material_name"] = str(cand), cand.name
+                fixed["photo"] += 1
+    for m in info.get("materials", {}).get("audios", []):
+        p = Path(m.get("path") or "")
+        if not p.exists() and p.name in assets:
+            m["path"] = str(assets[p.name]); fixed["audio"] += 1
+    text = json.dumps(info, ensure_ascii=False)
+    for f in files:
+        f.write_text(text)
+    meta_p = dest / "draft_meta_info.json"
+    if meta_p.exists():
+        meta = json.loads(meta_p.read_text())
+        for entry in meta.get("draft_materials", []):
+            for v in entry.get("value", []):
+                p = Path(v.get("file_Path") or "")
+                if p.name and not p.exists() and p.name in assets:
+                    v["file_Path"] = str(assets[p.name]); fixed["pool"] += 1
+        meta_p.write_text(json.dumps(meta, ensure_ascii=False))
+    return fixed
+
+
 # ----------------------------------------------------------------- entry
 
 def handoff(video: Path, segs: list, output: Path, work: Path, name: str = None) -> Path:
@@ -217,18 +299,26 @@ def handoff(video: Path, segs: list, output: Path, work: Path, name: str = None)
 
 
 def main() -> None:
+    global open_capcut
     import argparse
     ap = argparse.ArgumentParser(description="Send a cutlogic cut list to CapCut as an editable draft.")
     ap.add_argument("cuts", type=Path, help="work/<video>.cuts.json written by cutlogic")
     ap.add_argument("--name", help="draft name shown in CapCut")
     ap.add_argument("--no-open", action="store_true", help="build and install the draft but don't launch CapCut")
+    ap.add_argument("--repair", metavar="DRAFT", help="fix media paths of an installed CapCut draft by name and exit")
     args = ap.parse_args()
+    if args.repair:
+        quit_capcut()
+        source = Path(json.loads(args.cuts.read_text())["video"]) if args.cuts.exists() else None
+        print(repair_draft(DRAFTS_DIR / args.repair, source=source))
+        if not args.no_open:
+            open_capcut(DRAFTS_DIR / args.repair)
+        return
     cuts = json.loads(args.cuts.read_text())
     video = Path(cuts["video"])
     segs = [(s["start"], s["end"]) for s in cuts["segments"]]
     work = args.cuts.resolve().parent
     if args.no_open:
-        global open_capcut
         open_capcut = lambda dest: None  # noqa: E731
     handoff(video, segs, Path(video.stem), work, name=args.name)
 
