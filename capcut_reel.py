@@ -5,7 +5,7 @@ keyword, callout, logo, badge, zoom keyframe and sound cue can be moved,
 restyled or deleted in CapCut. The edit follows Naya's 2026-10-03 reel style
 guide: Poppins Bold at -1 tracking, white captions of 1-3 words at lower
 chest, one keyword per sentence in butter yellow and 30% bigger with a pop,
-a caps hook title in the top third from 0.0s, number callouts for every
+a caps hook title just below Instagram's top-20% crop from 0.0s, number callouts for every
 spoken figure, literal logo pop-ups that slide in for ~2.5s, brand-oxblood
 badge pills for chapter marks and the held CTA, slow + punch zooms, and
 light whoosh/pop cues on their own tracks. No text layer crosses a cut join.
@@ -34,10 +34,15 @@ TRACK = -0.05  # -> -1 in CapCut's letter-spacing units
 CANVAS = (1080, 1920)
 
 # vertical positions in half-canvas-height units (negative = down)
-Y_HOOK_1, Y_HOOK_2 = 0.66, 0.50
+# Instagram's home feed crops the top ~20% of a reel (and overlays the bottom
+# ~15%), so no text may sit above the 20% line. transform_y is in half-canvas
+# units (+1 = top edge): the line is at y = 0.60, and a text box must clear it.
+SAFE_TOP = 0.20            # fraction of the height cut off at the top
+PX_PER_SIZE = 3.0          # measured: CapCut font_size 15 ~ 45 px cap height on 1920
+Y_HOOK_1, Y_HOOK_2 = 0.54, 0.47   # the band between the 20% line and the top of her hair (~660 px)
 Y_CAPTION = -0.30     # lower chest
 Y_CALLOUT = -0.52     # over the desk edge
-Y_BADGE, X_BADGE = 0.74, 0.42   # top-right, above the shoulder
+Y_BADGE, X_BADGE = 0.54, 0.42   # right side, level with the hook line, below the crop
 Y_POPUP, X_POPUP = 0.12, 0.60    # on the empty wall beside the head, clear of hair and captions; scale 1.0 = logo fitted to the full canvas
 POPUP_SCALE = 0.2                 # ~216 px on a 1080 canvas
 
@@ -126,6 +131,18 @@ def popup_sheet(video: Path, segs: list, popups: list, logos: Path, out: Path) -
     print(f"pop-up placement sheet -> {out}")
 
 
+def safe_text_y(y: float, font_size: float, label: str = "") -> float:
+    """Lower a text layer whose box would reach into the cropped top band."""
+    half_px = font_size * PX_PER_SIZE * 0.5 + 24      # glyph half-height + pill padding/margin
+    top_px = CANVAS[1] / 2 - y * CANVAS[1] / 2 - half_px
+    limit_px = SAFE_TOP * CANVAS[1]
+    if top_px < limit_px:
+        y_new = round((CANVAS[1] / 2 - limit_px - half_px) / (CANVAS[1] / 2), 3)
+        print(f"note: '{label}' moved from y={y} to y={y_new} to stay below the top {int(SAFE_TOP*100)}% crop", file=sys.stderr)
+        return y_new
+    return y
+
+
 def norm(t):
     return re.sub(r"[^a-z0-9$']", "", t.lower())
 
@@ -193,7 +210,10 @@ def main():
     proc = ch.ensure_server(a.work)
     try:
         draft = ch._post("/create_draft", {"width": CANVAS[0], "height": CANVAS[1]})["draft_id"]
-        post = lambda ep, body: ch._post(ep, {"draft_id": draft, **body})  # noqa: E731
+        def post(ep, body):
+            if ep == "/add_text" and "transform_y" in body:   # nothing above Instagram's 20% crop
+                body["transform_y"] = safe_text_y(body["transform_y"], body.get("font_size", 15), body.get("text", ""))
+            return ch._post(ep, {"draft_id": draft, **body})
         n = {"clips": 0, "captions": 0, "keywords": 0, "callouts": 0, "popups": 0, "badges": 0, "keyframes": 0, "sfx": 0}
 
         # 1. clips, in order
