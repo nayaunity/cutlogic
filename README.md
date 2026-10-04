@@ -44,6 +44,8 @@ contain, in order.
 | `--merge-gap` | 0.15 | Segments closer than this (seconds) are merged into one |
 | `--max-pause` | 0.35 | Silences inside a sentence longer than this are cut out |
 | `--no-verify` | off | Skip the QC pass |
+| `--no-capcut` | off | Skip the hand-off to CapCut after rendering |
+| `--capcut-name` | `<output> cutlogic <date time>` | Name of the CapCut draft |
 | `--no-probe` | off | In the QC pass, skip transcribing each cut's opener (faster, fewer API calls) |
 | `--work-dir` | `work/` | Where audio, transcript cache, and cut artifacts go |
 
@@ -77,5 +79,19 @@ contain, in order.
    the transcript mis-timed, and — unless `--no-probe` — a short
    transcription of each cut's opener to confirm its first word is heard.
    Flags are listed with their source timecodes.
+6. **Hand off to CapCut** — the same cut list is rebuilt as a CapCut draft:
+   every segment becomes a trimmed clip of the original footage on the main
+   track, laid end to end, so any cut edge can be nudged in the editor
+   instead of re-running cutlogic. Drafts are generated through a local
+   [VectCutAPI](https://github.com/sun-guannan/VectCutAPI) server (started
+   on demand), placed in CapCut's drafts folder, and CapCut is opened.
+   One-time setup: `scripts/install-vectcut.sh` clones VectCutAPI next to
+   this folder with its own venv and a `config.json` set to
+   `draft_profile: "capcut_legacy"` (the macOS CapCut layout; note the
+   project's `"capcut"` alias means JianYing Pro, not CapCut). The draft
+   references the original media file rather than copying it. If CapCut
+   was already open, quit and reopen it to see the new draft. A cut list
+   from an earlier run can be handed off on its own:
+   `python3 capcut_handoff.py work/<video>.cuts.json`.
 
 Inspect `work/cuts.json` to see exactly what was matched and where.

@@ -1059,6 +1059,9 @@ def main() -> None:
     ap.add_argument("--work-dir", type=Path, default=Path("work"))
     ap.add_argument("--no-probe", action="store_true",
                     help="verify: skip transcribing each cut's opener (faster, fewer API calls)")
+    ap.add_argument("--no-capcut", action="store_true",
+                    help="don't hand the cut to CapCut as an editable draft after rendering")
+    ap.add_argument("--capcut-name", help="name for the CapCut draft (default: '<output> cutlogic <date time>')")
     ap.add_argument("--no-verify", action="store_true",
                     help="skip the QC pass (transcribe the render, diff against script)")
     args = ap.parse_args()
@@ -1118,6 +1121,15 @@ def main() -> None:
     if not args.no_verify:
         verify(args.output, args.script.read_text(), args.work_dir, api_key,
                video=args.video, segs=segs, words_src=words, probe=not args.no_probe)
+    if not args.no_capcut:
+        # Hand the same cut list to CapCut as trimmed clips of the source so
+        # any edge can be nudged there. Never fails the cut: the MP4 exists.
+        try:
+            import capcut_handoff
+            capcut_handoff.handoff(args.video, [tuple(s) for s in segs], args.output,
+                                   args.work_dir, name=args.capcut_name)
+        except Exception as e:  # noqa: BLE001
+            print(f"      CapCut hand-off skipped: {e}")
     print(f"\ndone: {args.output}")
 
 
