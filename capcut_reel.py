@@ -232,6 +232,7 @@ def main():
         # 2. per sentence: keyword, figures, captions
         sents = sentences(words)
         keywords, figures, punch_times, pop_times, popups = [], [], [], [], []
+        bell_times, send_times = [], []   # iMessage bubbles: receive chime / send tone
         logos = prep_logos(a.logos, a.work)
         chunks = []  # (text, start, end, style)
         for sent in sents:
@@ -382,8 +383,29 @@ def main():
                     st, en = off_joins(st, en)
                 if en - st < 1.0:
                     continue
-                png = stk.render(spec, sticker_dir / f"{i:02d}_{spec['kind']}.png")
                 from PIL import Image as _Im
+                if spec["kind"] == "imessage":
+                    # one layer per bubble, rising in on its own beat like a live thread
+                    layers = stk.imessage_layers(spec, sticker_dir / f"{i:02d}_imessage")
+                    stagger = spec.get("stagger", 0.9)
+                    if not hold:
+                        en = min(D - 0.02, max(en, st + stagger * (len(layers) - 1) + 1.6))
+                    h = _Im.open(layers[0][0]).height
+                    cy = SAFE_TOP * CANVAS[1] + 16 + h / 2
+                    ty = round((CANVAS[1] / 2 - cy) / (CANVAS[1] / 2), 3)
+                    for j, (png, who) in enumerate(layers):
+                        bst = round(min(st + j * stagger, en - 0.8), 3)
+                        body = {"image_url": str(png.resolve()), "start": bst, "end": round(en, 3), "transform_y": ty,
+                                "transform_x": 0, "scale_x": 1.0, "scale_y": 1.0, "track_name": f"image_bubbles_{j}",
+                                "intro_animation": "Slide_Up", "intro_animation_duration": 0.35}
+                        if not hold:
+                            body.update({"outro_animation": "Fade_Out", "outro_animation_duration": 0.3})
+                        post("/add_image", body)
+                        (send_times if who == "me" else bell_times).append(bst)
+                    sticker_spans.append((st, en)); n["stickers"] = n.get("stickers", 0) + 1
+                    popups.append((st + stagger * (len(layers) - 1), stk.render(spec, sticker_dir / f"{i:02d}_imessage_all.png"), "sticker", ty))
+                    continue
+                png = stk.render(spec, sticker_dir / f"{i:02d}_{spec['kind']}.png")
                 h = _Im.open(png).height
                 cy = SAFE_TOP * CANVAS[1] + 16 + h / 2            # top of the strip just under the crop line
                 ty = round((CANVAS[1] / 2 - cy) / (CANVAS[1] / 2), 3)
@@ -426,6 +448,11 @@ def main():
             if whoosh.exists() and 0.3 <= t0 <= D - 0.8: cue(whoosh, "sfx_whoosh", t0, 0.25)
         for t0 in spaced(pop_times, 0.12):
             if pop.exists() and t0 <= D - 0.5: cue(pop, "sfx_pop", t0, 0.2)
+        bell, send = a.sfx / "bell.wav", a.sfx / "send.wav"   # iMessage receive chime / send tone
+        for t0 in spaced(bell_times, 0.3):
+            if bell.exists() and t0 <= D - 0.4: cue(bell, "sfx_bell", t0, 0.3)
+        for t0 in spaced(send_times, 0.3):
+            if send.exists() and t0 <= D - 0.3: cue(send, "sfx_send", t0, 0.3)
 
         out_base = (a.work / "capcut").resolve(); out_base.mkdir(parents=True, exist_ok=True)
         ch._post("/save_draft", {"draft_id": draft, "draft_folder": str(out_base), "auto_deploy": False})

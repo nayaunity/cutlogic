@@ -86,7 +86,9 @@ def _place(content: Image.Image, align: str, margin=48) -> Image.Image:
 
 # ------------------------------------------------------------ iMessage
 
-def imessage(bubbles, align="center", text_size=34, max_w=680, **_):
+def imessage(bubbles, align="center", text_size=34, max_w=680, only=None, **_):
+    """One strip with the whole thread laid out; with only=i, every bubble but
+    the i-th is left transparent so the per-bubble layers stack in place."""
     fnt = font(SF, text_size)
     pad_x, pad_y, gap, r = 22 * SS, 14 * SS, 8 * SS, 22 * SS
     tmp = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
@@ -103,7 +105,9 @@ def imessage(bubbles, align="center", text_size=34, max_w=680, **_):
     img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     y = 4 * SS
-    for b, lines, w, h, lh in laid:
+    for i, (b, lines, w, h, lh) in enumerate(laid):
+        if only is not None and i != only:
+            y += h + gap; continue
         mine = b.get("from") == "me"
         x = width - w - 4 * SS if mine else 4 * SS
         fill = IOS_BLUE if mine else IOS_GREY
@@ -201,6 +205,19 @@ def card(title, lines=(), tag=None, align="center", width=720, **_):
 
 
 RENDERERS = {"imessage": imessage, "search": search, "notification": notification, "card": card}
+
+
+def imessage_layers(spec: dict, out_stem: Path) -> list:
+    """Render an iMessage thread as one PNG per bubble (same canvas, same
+    transform_y) so each can rise in on its own beat. Returns
+    [(png_path, "me"|"them"), ...] in thread order."""
+    args = {k: v for k, v in spec.items() if k not in ("kind", "at", "dur", "y", "x", "delay", "anim", "stagger")}
+    out = []
+    for i, b in enumerate(spec["bubbles"]):
+        p = out_stem.parent / f"{out_stem.name}_{i}.png"
+        imessage(only=i, **args).save(p)
+        out.append((p, b.get("from", "them")))
+    return out
 
 
 def render(spec: dict, out: Path) -> Path:
