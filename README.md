@@ -44,6 +44,9 @@ contain, in order.
 | `--merge-gap` | 0.15 | Segments closer than this (seconds) are merged into one |
 | `--max-pause` | 0.35 | Silences inside a sentence longer than this are cut out |
 | `--no-verify` | off | Skip the QC pass |
+| `--no-capcut` | off | Skip the hand-off to CapCut after rendering |
+| `--capcut-name` | `<output> cutlogic <date time>` | Name of the CapCut draft |
+| `--no-probe` | off | In the QC pass, skip transcribing each cut's opener (faster, fewer API calls) |
 | `--work-dir` | `work/` | Where audio, transcript cache, and cut artifacts go |
 
 ## How it works
@@ -61,11 +64,34 @@ contain, in order.
    frame-accurate cuts, then concatenated into the output. Cut boundaries are
    snapped to measured speech energy: heads skip breaths (loud but brief),
    tails keep soft word endings, and pauses hiding un-transcribed retakes are
-   detected and cut around.
+   detected and cut around. Energy thresholds are calibrated to the
+   recording's own speech level first, so a quiet phone recording (or a
+   presenter who drops her voice reading numbers) isn't trimmed as silence.
 5. **Verify** — the rendered cut is itself transcribed and diffed against the
    script. You get a fidelity score and a timestamped list of anything that
    differs (missing phrases, delivery deviations, suspect boundaries), saved
-   to `work/verify.json`. This catches what input-side analysis can't — a
-   clipped word at a cut point is audible in the output, not the input.
+   to `work/<output>.verify.json`. This catches what input-side analysis
+   can't — a clipped word at a cut point is audible in the output, not the
+   input. The transcript diff is deaf to some defects, though, so every cut
+   edge is also inspected in the source audio: voice still sounding right
+   after a cut (a trimmed ending), breath-level audio kept ahead of the
+   first word, a cut opening on a rising attack, speech inside a "pause"
+   the transcript mis-timed, and — unless `--no-probe` — a short
+   transcription of each cut's opener to confirm its first word is heard.
+   Flags are listed with their source timecodes.
+6. **Hand off to CapCut** — the same cut list is rebuilt as a CapCut draft:
+   every segment becomes a trimmed clip of the original footage on the main
+   track, laid end to end, so any cut edge can be nudged in the editor
+   instead of re-running cutlogic. Drafts are generated through a local
+   [VectCutAPI](https://github.com/sun-guannan/VectCutAPI) server (started
+   on demand), placed in CapCut's drafts folder, and CapCut is opened.
+   One-time setup: `scripts/install-vectcut.sh` clones VectCutAPI next to
+   this folder with its own venv and a `config.json` set to
+   `draft_profile: "capcut_legacy"` (the macOS CapCut layout; note the
+   project's `"capcut"` alias means JianYing Pro, not CapCut). The draft
+   references the original media file rather than copying it. If CapCut
+   was already open, quit and reopen it to see the new draft. A cut list
+   from an earlier run can be handed off on its own:
+   `python3 capcut_handoff.py work/<video>.cuts.json`.
 
 Inspect `work/cuts.json` to see exactly what was matched and where.

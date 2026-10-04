@@ -11,9 +11,11 @@ environment or a .env file next to this script.
 import argparse
 import difflib
 import json
+import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import urllib.error
@@ -230,9 +232,8 @@ def align(sentences: list, words: list, threshold: float,
     Among near-equal matches, prefers the later one — the last take of a
     flubbed line is usually the keeper.
     """
-    wtokens = [norm_tokens(w["word"]) for w in words]
-    wjoined = ["".join(t) for t in wtokens]  # full word, spaces stripped
-    wtokens = [(t[0] if t else "") for t in wtokens]
+    wexp = [norm_tokens(w["word"]) for w in words]  # every token a word expands to
+    wjoined = ["".join(t) for t in wexp]  # full word, spaces stripped
     MIN_TAIL = 0.15  # seconds of clean air needed after a take's last word
 
     def tail_air(we: int) -> float:
@@ -246,7 +247,11 @@ def align(sentences: list, words: list, threshold: float,
         boundary refinement (compound-word splits like "SkillsBuild" vs
         "skills build" would skew token-level edges)."""
         n = len(stoks)
-        lengths = sorted({max(1, round(n * f)) for f in (0.8, 1.0, 1.2)})
+        # Window lengths are in ASR words, but n counts script tokens, and one
+        # spoken word can expand to many tokens ("$33,330" -> thirty three
+        # thousand three hundred thirty). Always try one- and two-word
+        # windows too so such lines can still match.
+        lengths = sorted({1, 2} | {max(1, round(n * f)) for f in (0.6, 0.8, 1.0, 1.2)})
         sm = difflib.SequenceMatcher(autojunk=False)
         sm.set_seq2(stoks)
         smc = difflib.SequenceMatcher(autojunk=False)
@@ -262,15 +267,19 @@ def align(sentences: list, words: list, threshold: float,
                 end = start + length
                 if end > len(words):
                     continue
-                sm.set_seq1(wtokens[start:end])
+                sm.set_seq1([tok for k in range(start, end) for tok in wexp[k]])
                 if sm.real_quick_ratio() < threshold:
                     continue
                 score = sm.ratio()
                 if best is None or score > best[0] + 0.02:
                     best = (score, start, end - 1)
                 elif prefer_later and score >= threshold and score >= best[0] - 0.02:
-                    # near-tie at/above threshold: prefer the later take
-                    best = (score, start, end - 1)
+                    # Near-tie at/above threshold. The token scan only sees
+                    # each word's first token, so "$2,500" and "$0" look the
+                    # same here; break the tie on full characters and only
+                    # then prefer the later take.
+                    if char_score(start, end - 1) >= char_score(best[1], best[2]) - 0.02:
+                        best = (score, start, end - 1)
         if best is None or best[0] < threshold:
             return best
         best = (char_score(best[1], best[2]), best[1], best[2])
@@ -406,15 +415,29 @@ def align(sentences: list, words: list, threshold: float,
 def build_segments(matches: list, words: list, video: Path,
                    pad_pre: float, pad_post: float,
                    merge_gap: float, max_pause: float, duration: float) -> list:
+    global LAST_FOLLOW
     # Split each matched sentence at internal silences longer than max_pause
     # (reading pauses, breaths) so dead air inside a take gets cut too.
     wnorm = ["".join(norm_tokens(w["word"])) for w in words]
     spans = []  # [first_word_index, last_word_index]
     for m in matches:
+        # ASR sometimes splits one spoken word into two identical contiguous
+        # tokens ("i" 507.43-507.67 + "i" 507.67-508.23); the aligner's
+        # later-take preference then opens the cut on the second token, after
+        # the voice has already ended. Back up onto the first one.
+        while m.wstart > 0 and wnorm[m.wstart - 1] == wnorm[m.wstart] and \
+                words[m.wstart]["start"] - words[m.wstart - 1]["end"] <= 0.05:
+            m.wstart -= 1
         mspans = []
         run_start = m.wstart
         for i in range(m.wstart, m.wend):
-            if words[i + 1]["start"] - words[i]["end"] > max_pause:
+            gap = words[i + 1]["start"] - words[i]["end"]
+            # Short ASR gaps aren't always pauses: a drawn-out word or an
+            # untranscribed syllable can fill one, and cutting it removes
+            # speech. Check the audio. Long gaps (>= 0.8s) are always split
+            # so the hidden-retake logic below can inspect them.
+            if gap > max_pause and (gap >= 0.8 or gap_is_quiet(
+                    video, words[i]["end"], words[i + 1]["start"])):
                 mspans.append([run_start, i])
                 run_start = i + 1
         mspans.append([run_start, m.wend])
@@ -439,15 +462,27 @@ def build_segments(matches: list, words: list, video: Path,
         dropped = set()
         for idx, (a, b) in enumerate(zip(mspans, mspans[1:])):
             g0, g1 = words[a[1]]["end"] + 0.05, words[b[0]]["start"]
-            if g1 - g0 < 0.8:
-                continue
-            runs = voiced_runs(video, g0, g1)
-            if runs and runs[-1][1] >= g1 - 0.25:  # hidden speech leads into b
-                b[2] = max(g0, runs[-1][0] - 0.05)
-                if a[1] - a[0] + 1 <= 4:
+            if g1 - g0 >= 0.8:
+                runs = voiced_runs(video, g0, g1)
+                if runs and runs[-1][1] >= g1 - 0.25:  # hidden speech leads into b
+                    b[2] = max(g0, runs[-1][0] - 0.05)
+                    if a[1] - a[0] + 1 <= 4:
+                        dropped.add(idx)
+                        print(f"      note: dropping false start before "
+                              f"{words[b[0]]['start']:.2f}s (hidden retake in pause)")
+            elif len(set(wnorm[a[0]:a[1] + 1])) == 1 and g1 - g0 >= 0.3:
+                # A lone word stalled between pauses ("launch plan | for | a
+                # membership") is a false start when the ASR absorbed its
+                # restart into the next word: voice leads into b well before
+                # b's first marked word. Drop the stall, open b at the voice.
+                iv = speech_intervals(video, g0, g1 + 0.2, noise="-27dB",
+                                      min_silence=0.05)
+                if iv and iv[-1][1] >= g1 and iv[-1][0] <= g1 - 0.04:
+                    b[2] = max(g0, iv[-1][0] - 0.05)
                     dropped.add(idx)
-                    print(f"      note: dropping false start before "
-                          f"{words[b[0]]['start']:.2f}s (hidden retake in pause)")
+                    print(f"      note: dropping stalled word "
+                          f"'{words[a[0]]['word']}' at {words[a[0]]['start']:.2f}s "
+                          f"(restart absorbed into next word)")
         spans.extend(s for i, s in enumerate(mspans) if i not in dropped)
 
     segs = []
@@ -457,7 +492,9 @@ def build_segments(matches: list, words: list, video: Path,
         if t0_override is not None:
             t0 = t0_override
         else:
-            t0 = words[i0]["start"] - pad_pre
+            # ASR word starts can be late as well as early: look back
+            # further than the pad and let head_onset() find the onset.
+            t0 = words[i0]["start"] - max(pad_pre, 0.12)
             if i0 > 0:
                 t0 = max(t0, words[i0 - 1]["end"] + 0.05)
             t0 = max(0.0, min(t0, words[i0]["start"]))
@@ -481,38 +518,98 @@ def build_segments(matches: list, words: list, video: Path,
         win_end = min(t1, max(words[i0]["end"] + 0.1, t0 + 2.5))
         runs = voiced_runs(video, t0, win_end)
         if runs:
-            onset = max(t0, runs[0][0] - pad_pre - 0.10)
-            w0s, w0e = words[i0]["start"], words[i0]["end"]
-            if onset > w0s + 0.02 and \
-                    mean_volume(video, w0s, min(w0e, onset)) > SPEECH_LEVEL - 11:
-                # The first word's span has real audio — it's a quiet short
-                # word ("a", "the"), not an absorbed breath. Don't skip it.
-                onset = max(t0, w0s - pad_pre)
-            t0 = onset
-        iv = speech_intervals(video, max(t0, words[i1]["start"] - 0.1), t1,
-                              noise=thr_soft(), min_silence=0.12)
-        if not iv:
-            # No audible speech near the claimed last word — its ASR span sits
-            # in dead air. Search the whole segment for the true last speech.
-            iv = speech_intervals(video, t0, t1, noise=thr_soft(),
-                                  min_silence=0.12)
+            # head_onset keeps a quiet voiced first word ("a", "the") by
+            # ZCR, so no separate volume safeguard is needed here.
+            t0 = head_onset(video, t0, runs[0][0], words[i0]["start"],
+                            words[i0]["word"], margin=pad_pre)
+        else:
+            # No sustained voice found (a short quiet word): don't keep
+            # the whole look-back as dead air.
+            t0 = max(t0, words[i0]["start"] - pad_pre)
+        tail_from = max(t0, words[i1]["start"] - 0.1)
+        # ASR word ends can also be EARLY (a drawn-out "monetizing", a
+        # trailing "L"): let the tail follow voice past the marked end, but
+        # only voice contiguous with the word — never the next word or a
+        # breath after a pause.
+        t1_ext = words[i1]["end"] + 0.45
+        if i1 + 1 < len(words):
+            t1_ext = min(t1_ext, words[i1 + 1]["start"] - 0.05)
+        t1_ext = min(duration, max(t1_ext, t1))
+        v_end = last_voice(video, tail_from, t1_ext)
+        if v_end > t1 - pad_post + 0.02:
+            lv = rms_windows(video, max(tail_from, words[i1]["end"] - 0.06), v_end, 0.02)
+            run, contiguous = 0, True
+            for x in lv:
+                run = run + 1 if x < ROOM_DB + 3.0 else 0
+                if run >= 5:
+                    contiguous = False
+                    break
+            if contiguous:
+                t1 = max(t1, min(t1_ext, v_end + pad_post))
+            else:
+                v_end = last_voice(video, tail_from, t1)
         last = "".join(norm_tokens(words[i1]["word"]))
-        if iv:
-            snapped = min(t1, iv[-1][1] + pad_post)
+        if v_end >= tail_from and words[i1]["start"] >= v_end - 0.05:
+            # The whole last word sits under the tail threshold (a
+            # trailed-off "now"): it is a word, not a fading ending, so
+            # follow it to its marked end while it stays above room tone.
+            lim = min(t1_ext, words[i1]["end"] + 0.1)
+            if lim > v_end:
+                lw = level_windows(video, v_end, lim, 0.02)
+                k, dips = 0, 0
+                while k < len(lw) and dips <= 1:
+                    if lw[k][0] > ROOM_DB + 4.0:
+                        dips = 0
+                    else:
+                        dips += 1
+                    k += 1
+                v_end = v_end + max(0, k - dips) * 0.02
+                t1 = max(t1, min(t1_ext, v_end + pad_post))
+        sib_final = last[-1:] in "sz" or words[i1]["word"].startswith("$")
+        if sib_final and v_end >= tail_from:
+            # A final "s" is often detached: a short gap, then a soft
+            # high-frequency burst near room tone ("dollar...s"). Look
+            # ahead to the word's marked end for it and keep it.
+            lim = min(t1_ext, words[i1]["end"] + 0.1)
+            if lim > v_end + 0.04:
+                lw = level_windows(video, v_end, lim, 0.02)
+                run_s, burst_end, missed = 0, None, False
+                for k, (r, z) in enumerate(lw):
+                    if k * 0.02 > 0.4 and burst_end is None:
+                        break
+                    if z >= 0.25 and r > ROOM_DB - 1.0:
+                        run_s += 1
+                        missed = False
+                        if run_s >= 3:
+                            burst_end = k + 1
+                    elif run_s and not missed:
+                        missed = True  # tolerate one weak window inside the burst
+                    else:
+                        if burst_end is not None:
+                            break
+                        run_s, missed = 0, False
+                if burst_end is not None:
+                    v_end = v_end + burst_end * 0.02
+                    LAST_FOLLOW = 0.0
+                    t1 = max(t1, min(t1_ext, v_end + 0.03))
+        if v_end >= tail_from:
+            # The trailing-sound follow already acts as padding.
+            snapped = min(t1, v_end + max(0.02, pad_post - LAST_FOLLOW))
             # A final stop consonant ("need", "build") has a near-silent
             # closure + release just past the energy end. Keep a release
             # allowance, capped near the ASR word end — ASR ends overrun
             # into silence, so they can't be trusted on their own either.
             if last[-1:] in "bdgkpt":
                 snapped = max(snapped,
-                              min(iv[-1][1] + 0.2, words[i1]["end"] + 0.05, t1))
+                              min(v_end + 0.08, words[i1]["end"] + 0.02, t1))
             elif last[-1:] in "sz":
-                # Trailing sibilants drag on; cut right at the sibilant's end
-                # instead of padding after it — snappy pacing, "s" still lands.
-                snapped = min(snapped, max(iv[-1][1] + 0.02, t0 + 0.1))
+                # Trailing sibilants drag on: pad only a little after the
+                # measured end instead of the full pad_post. Never cut into
+                # the "s" itself — on a quiet recording that removes it.
+                snapped = min(snapped, max(v_end + 0.03, t0 + 0.1))
             t1 = max(snapped, t0 + 0.1)
         if last[-1:] in "sz":
-            t1 = max(min(t1, words[i1]["end"] + 0.05), t0 + 0.1)
+            t1 = max(min(t1, words[i1]["end"] + 0.2), t0 + 0.1)
         # Merge only forward-adjacent spans; a reused earlier take jumps
         # backward in source time and must stay its own segment.
         if segs and t0 >= segs[-1][0] and t0 - segs[-1][1] <= merge_gap:
@@ -547,14 +644,231 @@ def build_segments(matches: list, words: list, video: Path,
     return segs
 
 
+# Every energy threshold below was tuned on footage whose spoken sentences
+# average REF_SPEECH_LEVEL dB. A quieter recording (phone across the room, a
+# presenter who drops her voice reading figures) pushes real speech under
+# those fixed floors and the cutter trims it as silence. calibrate_level()
+# measures the actual speech level and LEVEL_OFFSET shifts every floor by
+# the difference, clamped so a very quiet file never sinks into room noise.
+REF_SPEECH_LEVEL = -15.0
+LEVEL_OFFSET = 0.0
+NOISE_FLOOR = -50.0
+TAIL_DB = -25.0  # RMS level below which a word's tail counts as over
+ROOM_DB = -60.0  # measured room tone (RMS)
+WHISPER_DB = -54.0  # floor for following a trailed-off word ending
+SPEECH_DB = -15.0  # measured median speech level (RMS)
+LAST_FOLLOW = 0.0  # set by last_voice(): seconds of trailing sound followed
+
+
+def calibrate_level(video: Path, matches: list) -> float:
+    global LEVEL_OFFSET, NOISE_FLOOR, TAIL_DB, ROOM_DB, WHISPER_DB, SPEECH_DB
+    spans = [(m.t0, m.t1) for m in matches if m.t1 - m.t0 >= 2.0][:8]
+    if not spans:
+        spans = [(m.t0, m.t1) for m in matches][:8]
+    levels = sorted(mean_volume(video, a, b) for a, b in spans)
+    level = levels[len(levels) // 2]
+    SPEECH_DB = level
+    LEVEL_OFFSET = max(-30.0, min(5.0, level - REF_SPEECH_LEVEL))
+    # Room tone: the pauses between matched takes. silencedetect compares
+    # sample peaks, which sit well above the RMS mean_volume reports, so no
+    # floor may go within ~12 dB of the room RMS or tails never snap and
+    # every cut drags its ASR word-end overrun along.
+    gaps = [(a.t1 + 0.3, b.t0 - 0.3) for a, b in zip(matches, matches[1:])
+            if b.t0 - a.t1 >= 1.2][:8]
+    TAIL_DB = level - 18.0
+    # The gaps also hold unscripted retakes, so take a low percentile of
+    # short windows rather than a mean — the quiet tenth is room tone.
+    win = []
+    for a, b in gaps:
+        win.extend(rms_windows(video, a, b, 0.1))
+    if win:
+        win.sort()
+        noise = win[len(win) // 10]
+        ROOM_DB = noise
+        # Trailed-off endings are followed down to just above room tone on
+        # a quiet recording, but on loud footage that floor is 35 dB under
+        # speech and reverb decay lives there: cap it relative to speech so
+        # tails don't drag.
+        WHISPER_DB = max(noise + 8.0, level - 25.0)
+        NOISE_FLOOR = noise + 12.0
+        # last_voice() compares RMS, so it can sit closer to the room RMS
+        # than the peak-based silencedetect floor above. On a quiet phone
+        # recording (speech ~-41 dB, room ~-61 dB) a +12 floor lands only
+        # 8 dB under speech and trims soft final syllables ("dollars").
+        TAIL_DB = max(TAIL_DB, noise + 8.0)
+        print(f"      speech level {level:.1f} dB, room tone {noise:.1f} dB "
+              f"-> thresholds shifted {LEVEL_OFFSET:+.1f} dB, "
+              f"floor {NOISE_FLOOR:.1f} dB, tail {TAIL_DB:.1f} dB")
+    else:
+        print(f"      speech level {level:.1f} dB -> thresholds shifted "
+              f"{LEVEL_OFFSET:+.1f} dB, tail {TAIL_DB:.1f} dB")
+    return LEVEL_OFFSET
+
+
+def rms_windows(video: Path, t0: float, t1: float, step: float = 0.02) -> list:
+    """RMS level (dB) of consecutive `step`-second windows in [t0, t1]."""
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "error", "-ss", f"{t0:.3f}", "-to", f"{t1:.3f}",
+         "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
+        capture_output=True,
+    )
+    raw = proc.stdout
+    n = len(raw) // 2
+    if n == 0:
+        return []
+    samples = struct.unpack(f"<{n}h", raw)
+    w = max(1, int(16000 * step))
+    out = []
+    for i in range(0, n - w + 1, w):
+        chunk = samples[i:i + w]
+        rms = math.sqrt(sum(x * x for x in chunk) / len(chunk))
+        out.append(20 * math.log10(rms / 32768 + 1e-9))
+    return out
+
+
+def level_windows(video: Path, t0: float, t1: float, step: float = 0.02) -> list:
+    """(RMS dB, zero-crossing rate) per `step`-second window in [t0, t1].
+
+    ZCR separates what energy can't on a close-miked phone recording:
+    an inhale is broadband noise (high ZCR), a vowel is periodic (low)."""
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "error", "-ss", f"{t0:.3f}", "-to", f"{t1:.3f}",
+         "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
+        capture_output=True,
+    )
+    raw = proc.stdout
+    n = len(raw) // 2
+    if n == 0:
+        return []
+    samples = struct.unpack(f"<{n}h", raw)
+    w = max(1, int(16000 * step))
+    out = []
+    for i in range(0, n - w + 1, w):
+        chunk = samples[i:i + w]
+        rms = math.sqrt(sum(x * x for x in chunk) / len(chunk))
+        zc = sum(1 for a, b in zip(chunk, chunk[1:]) if (a < 0) != (b < 0))
+        out.append((20 * math.log10(rms / 32768 + 1e-9), zc / len(chunk)))
+    return out
+
+
+ZCR_NOISY = 0.25  # above this a 20ms window is a fricative/plosive/aspiration
+
+
+def head_onset(video: Path, t0: float, run_start: float, w0s: float,
+               first_word: str = "", margin: float = 0.02) -> float:
+    """Where a cut should open ahead of the first word.
+
+    On a close-miked phone recording the inhale before a line is nearly
+    as loud as speech, so energy alone can't find the word. Measured on
+    such footage: the inhale is low-frequency (ZCR ~0.05) and 12-20 dB
+    under the vowel that follows; consonant onsets ("s", "st", "t") are
+    high-frequency (ZCR 0.4-0.8) and run straight into the vowel.
+
+    So: find the first window at speech level that is periodic (the
+    vowel), then walk back over high-ZCR windows for up to 0.25s (the
+    consonant onset), and over low-ZCR windows only while they are at
+    speech level (a quiet real word) or within 40ms of the vowel (a nasal
+    or approximant onset: "m", "w"). Stop at room tone. 30ms margin.
+    """
+    step = 0.02
+    # A nasal onset ("m", "n") is a quiet low-ZCR murmur that looks just
+    # like the inhale; a voiced "th" is similar. Let those words keep a
+    # longer soft onset; everything else gets one window.
+    fw = first_word.lower()
+    ramped = fw[:1] in "aeiouwlry"  # vowels and glides ramp up monotonically
+    soft = 0.16 if fw[:1] in "mn" else 0.02
+    a = max(t0, min(run_start, w0s) - 0.2)
+    b = max(run_start, w0s) + 0.6
+    win = level_windows(video, a, b, step)
+    if not win:
+        return max(t0, run_start - 0.03)
+    i = next((k for k, (r, z) in enumerate(win)
+              if r >= SPEECH_DB - 2.0 and z < 0.2), None)
+    if i is None:
+        i = min(len(win) - 1, max(0, int(round((run_start - a) / step))))
+    j = i
+    noisy = rising = quiet = 0.0
+    floor = win[i][0]  # strictly falling as we walk back = a real attack
+    while j > 0:
+        r, z = win[j - 1]
+        if z >= ZCR_NOISY:
+            if r <= ROOM_DB + 2.0 or noisy + step > 0.25:
+                break
+            noisy += step
+        else:
+            if r <= ROOM_DB + 4.0:
+                break
+            if r >= SPEECH_DB - 2.0:
+                pass  # speech level: a quiet real word, keep
+            elif ramped and r < floor - 1.0 and rising + step <= 0.12:
+                rising += step  # the vowel's own attack ramp (monotonic)
+                floor = r
+            elif quiet + step <= soft:
+                quiet += step  # nasal murmur / voiced onset allowance
+            else:
+                break
+        j -= 1
+    return max(t0, a + j * step - margin)
+
+
+def gap_is_quiet(video: Path, g0: float, g1: float) -> bool:
+    """True if the interior of an ASR word gap really drops to tail level
+    for most of its length (i.e. it is a pause, not mistimed speech)."""
+    if g1 - g0 < 0.2:
+        return True
+    lv = rms_windows(video, g0 + 0.05, g1 - 0.05, 0.02)
+    if not lv:
+        return True
+    return sum(1 for x in lv if x <= TAIL_DB) >= 0.5 * len(lv)
+
+
+def last_voice(video: Path, t0: float, t1: float) -> float:
+    """End time of the last window in [t0, t1] whose RMS is above TAIL_DB.
+
+    Peak-based silencedetect keeps reverb decay and breath alive long after
+    a word is over; RMS against a level calibrated between speech and room
+    tone finds where the word actually stops. Returns t0 if nothing is
+    voiced. Sets LAST_FOLLOW to how far past that point a trailing sound
+    was followed, so the caller can shrink its pad by that much.
+    """
+    global LAST_FOLLOW
+    step = 0.02
+    win = level_windows(video, t0, t1, step)
+    LAST_FOLLOW = 0.0
+    for i in range(len(win) - 1, -1, -1):
+        if win[i][0] > TAIL_DB:
+            # A speaker trailing off ends a line under TAIL_DB but above
+            # room tone, and a final sibilant sits even lower but is
+            # high-frequency (ZCR). Follow either for up to 0.2s; reverb
+            # decay and breath are low-ZCR and near room tone, so they
+            # are still cut.
+            j = i
+            while j + 1 < len(win) and j - i < int(0.06 / step):
+                r, z = win[j + 1]
+                if r > WHISPER_DB or (r > ROOM_DB + 5.0 and z >= 0.35):
+                    j += 1
+                else:
+                    break
+            LAST_FOLLOW = (j - i) * step
+            return t0 + (j + 1) * step
+    return t0
+
+
+def _shift_noise(noise: str) -> str:
+    base = float(noise.rstrip("dB"))
+    return f"{max(NOISE_FLOOR, base + LEVEL_OFFSET):.1f}dB"
+
+
 def speech_intervals(video: Path, t0: float, t1: float,
                      noise: str = "-35dB", min_silence: float = 0.25) -> list:
     """Actual speech spans (by audio energy) inside [t0, t1] of the video.
 
     The default -35dB floor is paranoid (quiet mumbles count as speech) —
     right for detecting hidden retakes. Boundary tightening passes -27dB so
-    breaths and room noise count as silence and get cut through.
+    breaths and room noise count as silence and get cut through. Floors are
+    relative to REF_SPEECH_LEVEL and shifted by LEVEL_OFFSET for the file.
     """
+    noise = _shift_noise(noise)
     proc = subprocess.run(
         ["ffmpeg", "-ss", f"{t0:.3f}", "-to", f"{t1:.3f}", "-i", str(video),
          "-vn", "-af", f"silencedetect=noise={noise}:d={min_silence}", "-f", "null", "-"],
@@ -574,34 +888,6 @@ def speech_intervals(video: Path, t0: float, t1: float,
     return intervals
 
 
-# Recording levels vary wildly between videos (a lav mic vs a phone across the
-# room), so energy thresholds are relative to the measured speech level.
-# The defaults correspond to the ~-19dB reference the rules were tuned on.
-SPEECH_LEVEL = -19.0
-
-
-def thr_voice() -> str:
-    return f"{SPEECH_LEVEL + 3:.0f}dB"   # voiced speech only; breaths below
-
-
-def thr_soft() -> str:
-    return f"{SPEECH_LEVEL - 8:.0f}dB"   # soft tails, sibilants, decay
-
-
-def calibrate_speech_level(video: Path, words: list) -> None:
-    """Sample volume over ASR word spans to find this video's speech level."""
-    global SPEECH_LEVEL
-    cands = [w for w in words if w["end"] - w["start"] >= 0.25]
-    if not cands:
-        return
-    step = max(1, len(cands) // 12)
-    samples = sorted(mean_volume(video, w["start"], w["end"])
-                     for w in cands[::step][:12])
-    SPEECH_LEVEL = samples[len(samples) // 2]
-    print(f"      speech level ~{SPEECH_LEVEL:.0f} dB "
-          f"(voice threshold {thr_voice()}, soft {thr_soft()})")
-
-
 def mean_volume(video: Path, t0: float, t1: float) -> float:
     proc = subprocess.run(
         ["ffmpeg", "-ss", f"{t0:.3f}", "-to", f"{t1:.3f}", "-i", str(video),
@@ -619,7 +905,7 @@ def voiced_runs(video: Path, t0: float, t1: float) -> list:
     them; duration does. Detect at voice level (-16dB), chain across brief
     stop-consonant closures, and keep only sustained runs.
     """
-    iv = speech_intervals(video, t0, t1, noise=thr_voice(), min_silence=0.05)
+    iv = speech_intervals(video, t0, t1, noise="-16dB", min_silence=0.05)
     runs = []
     for s, e in iv:
         if runs and s - runs[-1][1] <= 0.09:
@@ -645,30 +931,130 @@ def probe_duration(video: Path) -> float:
 
 def render(video: Path, segs: list, work: Path, output: Path) -> None:
     print(f"[4/5] cutting {len(segs)} segment(s) and concatenating...")
+    # Segments carry PCM audio: AAC frames are 23ms blocks with a priming
+    # delay, so stream-copying AAC segments leaves a partial frame and a
+    # timestamp overlap at every join. Players resolve those differently,
+    # and lip sync drifts. PCM joins are sample-exact; AAC is encoded once
+    # at the concat step.
     seg_files = []
     for i, (t0, t1) in enumerate(segs):
-        seg = work / f"seg_{i:03d}.mp4"
+        seg = work / f"seg_{i:03d}.mov"
         run(
             ["ffmpeg", "-y", "-ss", f"{t0:.3f}", "-to", f"{t1:.3f}", "-i", str(video),
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-             "-c:a", "aac", "-b:a", "192k", str(seg)],
+             "-c:a", "pcm_s16le", str(seg)],
             f"cutting segment {i} ({t0:.2f}-{t1:.2f}s)",
         )
         seg_files.append(seg)
         print(f"      seg {i:03d}: {t0:8.2f}s -> {t1:8.2f}s")
 
     concat_list = work / "segments.txt"
-    concat_list.write_text("".join(f"file '{s.resolve()}'\n" for s in seg_files))
+    # Pin each file's duration to the intended cut length so the concat
+    # offsets follow the audio exactly instead of the video's overhanging
+    # last frame.
+    concat_list.write_text("".join(
+        f"file '{s.resolve()}'\nduration {t1 - t0:.6f}\n"
+        for s, (t0, t1) in zip(seg_files, segs)))
+    # Each segment's video overhangs its audio by up to one frame (the last
+    # frame's display time runs past the cut), so the concat offset leaves a
+    # few-ms hole in the audio at every join. Without async resampling the
+    # AAC encoder closes those holes and the audio runs ahead of the video,
+    # drifting further with every cut. aresample=async pads them instead.
     run(
         ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
-         "-c", "copy", str(output)],
+         "-c:v", "copy",
+         "-af", "aresample=async=1000:min_hard_comp=0.002:first_pts=0",
+         "-c:a", "aac", "-b:a", "192k",
+         "-movflags", "+faststart", str(output)],
         "concatenation",
     )
+    for seg in seg_files:
+        seg.unlink()
 
 
 # ---------------------------------------------------------------------- verify
 
-def verify(output: Path, script_text: str, work: Path, api_key: str) -> None:
+def check_edges(video: Path, segs: list, words: list, api_key: str,
+                probe: bool = True) -> list:
+    """Inspect every cut edge in the SOURCE audio.
+
+    The transcript diff in verify() hears the output, but it is blind to a
+    breath kept ahead of a line, a soft ending trimmed as silence, or speech
+    inside a "pause" the ASR mis-timed. These checks look at the audio on
+    either side of each edge instead. Returns (source_time, message) pairs.
+    """
+    issues = []
+    quiet = ROOM_DB + 8.0  # TAIL_DB floor: real voice, not room hum
+    for k, (t0, t1) in enumerate(segs):
+        inside = [w for w in words if w["end"] > t0 + 0.02 and w["start"] < t1]
+        if not inside:
+            continue
+        first, last = inside[0]["word"], inside[-1]["word"]
+        # Tail: voice still going right after the cut.
+        after = rms_windows(video, t1, t1 + 0.15, 0.05)
+        if after and max(after) > quiet:
+            issues.append((t1, f"voice continues after the cut ending \"{last}\" "
+                               f"({max(after):.0f} dB) — clipped ending?"))
+        # Removed gap between close segments: must be silence, not speech.
+        if k + 1 < len(segs) and 0 < segs[k + 1][0] - t1 < 1.0:
+            gap = rms_windows(video, t1, segs[k + 1][0], 0.05)
+            if gap and max(gap) > ROOM_DB + 8.0:
+                issues.append((t1, f"speech inside the removed gap after \"{last}\" "
+                                   f"({max(gap):.0f} dB)"))
+        # Head: breath kept ahead of the first word, or an attack cut into.
+        pre = level_windows(video, t0 - 0.06, t0, 0.02)
+        if len(pre) >= 2 and pre[-1][0] > ROOM_DB + 12.0 and pre[-1][1] < 0.2 \
+                and pre[-1][0] >= pre[0][0] + 3.0:
+            issues.append((t0, f"cut opens on rising voice before \"{first}\" — "
+                               f"clipped opener?"))
+        head = level_windows(video, t0, t0 + 0.4, 0.02)
+        vi = next((i for i, (r, z) in enumerate(head)
+                   if r >= SPEECH_DB - 2.0 and z < 0.2), len(head))
+        breath = [r for r, z in head[:vi]
+                  if ROOM_DB + 5.0 < r < SPEECH_DB - 2.0 and z < 0.25]
+        allow = 10 if first[:1].lower() in "mn" else 4  # nasal murmur is kept by design
+        if len(breath) > allow:
+            issues.append((t0, f"{len(breath) * 20}ms of breath-level audio before "
+                               f"\"{first}\""))
+    if probe:
+        # Transcribe the first 2.4s of each cut from the source, with 0.5s of
+        # silence prepended (bare short clips come back empty), and check
+        # the first word is heard. ASR confusions on function words are
+        # common, so a loose prefix match is used.
+        tmp = video.parent / ".cutlogic-probe.ogg"
+        for t0, t1 in segs:
+            inside = [w for w in words if w["end"] > t0 + 0.02 and w["start"] < t1]
+            if not inside:
+                continue
+            exp = "".join(norm_tokens(inside[0]["word"]))
+            heard = []
+            for _ in range(2):
+                subprocess.run(
+                    ["ffmpeg", "-v", "error", "-y", "-ss", f"{t0:.3f}", "-t", "2.4",
+                     "-i", str(video), "-vn", "-ac", "1", "-ar", "16000",
+                     "-af", "adelay=500", "-c:a", "libopus", "-b:a", "48k", str(tmp)],
+                    capture_output=True)
+                try:
+                    heard = ["".join(norm_tokens(w["word"]))
+                             for w in resp_words(deepgram_post(tmp.read_bytes(), api_key))]
+                except Exception:
+                    heard = []
+                if heard:
+                    break
+            ok = bool(heard) and (heard[0] == exp or heard[0][:3] == exp[:3]
+                                  or heard[0].startswith(exp)
+                                  or (len(heard) > 1 and heard[1] == exp))
+            if not ok:
+                issues.append((t0, f"opener \"{inside[0]['word']}\" heard as "
+                                   f"\"{' '.join(heard[:3])}\" — clipped, or an ASR confusion"))
+        if tmp.exists():
+            tmp.unlink()
+    return sorted(issues)
+
+
+def verify(output: Path, script_text: str, work: Path, api_key: str,
+           video: Path = None, segs: list = None, words_src: list = None,
+           probe: bool = True) -> None:
     """QC pass: transcribe the rendered cut and diff it against the script.
 
     Catches what input-side analysis can't — clipped words at cut boundaries,
@@ -720,9 +1106,19 @@ def verify(output: Path, script_text: str, work: Path, api_key: str) -> None:
               "imperfect, so not every flag is a real defect)")
     else:
         print("      no differences beyond spelling — cut matches the script")
+    edge_issues = []
+    if video is not None and segs and words_src:
+        print(f"      checking {len(segs)} cut edges in the source audio"
+              + (" and probing each opener..." if probe else "..."))
+        edge_issues = check_edges(video, segs, words_src, api_key, probe)
+        for at, msg in edge_issues:
+            print(f"      [source {fmt_t(at)}] {msg}")
+        if not edge_issues:
+            print("      cut edges clean: no breath kept, no clipped word, no speech in removed gaps")
     (work / f"{output.stem}.verify.json").write_text(json.dumps({
         "fidelity": round(fidelity, 4),
         "issues": [{"at": at, "issue": msg} for at, msg in issues],
+        "edge_issues": [{"source_at": at, "issue": msg} for at, msg in edge_issues],
         "transcript": " ".join(w["word"] for w in words),
     }, indent=2))
 
@@ -750,6 +1146,11 @@ def main() -> None:
     ap.add_argument("--max-pause", type=float, default=0.35,
                     help="cut silences inside a sentence longer than this many seconds")
     ap.add_argument("--work-dir", type=Path, default=Path("work"))
+    ap.add_argument("--no-probe", action="store_true",
+                    help="verify: skip transcribing each cut's opener (faster, fewer API calls)")
+    ap.add_argument("--no-capcut", action="store_true",
+                    help="don't hand the cut to CapCut as an editable draft after rendering")
+    ap.add_argument("--capcut-name", help="name for the CapCut draft (default: '<output> cutlogic <date time>')")
     ap.add_argument("--no-verify", action="store_true",
                     help="skip the QC pass (transcribe the render, diff against script)")
     args = ap.parse_args()
@@ -767,7 +1168,6 @@ def main() -> None:
 
     audio = extract_audio(args.video, args.work_dir)
     words = transcribe(args.video, audio, args.work_dir, api_key)
-    calibrate_speech_level(args.video, words)
     duration = probe_duration(args.video)
     sentences = split_sentences(args.script.read_text())
     print(f"[3/5] aligning {len(sentences)} script sentence(s) "
@@ -785,6 +1185,7 @@ def main() -> None:
         flag = "LOW" if m.low else "   "
         print(f"{flag} {m.score:5.2f}  {fmt_t(m.t0):>9}  {fmt_t(m.t1):>9}  {m.sentence[:70]}")
 
+    calibrate_level(args.video, matches)
     segs = build_segments(matches, words, args.video, args.pad_pre, args.pad_post,
                           args.merge_gap, args.max_pause, duration)
     kept = sum(t1 - t0 for t0, t1 in segs)
@@ -812,7 +1213,17 @@ def main() -> None:
 
     render(args.video, segs, args.work_dir, args.output)
     if not args.no_verify:
-        verify(args.output, args.script.read_text(), args.work_dir, api_key)
+        verify(args.output, args.script.read_text(), args.work_dir, api_key,
+               video=args.video, segs=segs, words_src=words, probe=not args.no_probe)
+    if not args.no_capcut:
+        # Hand the same cut list to CapCut as trimmed clips of the source so
+        # any edge can be nudged there. Never fails the cut: the MP4 exists.
+        try:
+            import capcut_handoff
+            capcut_handoff.handoff(args.video, [tuple(s) for s in segs], args.output,
+                                   args.work_dir, name=args.capcut_name)
+        except Exception as e:  # noqa: BLE001
+            print(f"      CapCut hand-off skipped: {e}")
     print(f"\ndone: {args.output}")
 
 
