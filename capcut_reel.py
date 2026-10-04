@@ -448,11 +448,13 @@ def main():
             if whoosh.exists() and 0.3 <= t0 <= D - 0.8: cue(whoosh, "sfx_whoosh", t0, 0.25)
         for t0 in spaced(pop_times, 0.12):
             if pop.exists() and t0 <= D - 0.5: cue(pop, "sfx_pop", t0, 0.2)
-        bell, send = a.sfx / "bell.wav", a.sfx / "send.wav"   # iMessage receive chime / send tone
+        # iMessage receive chime / send tone. 0.3 startled Naya ("quite loud"):
+        # message tones sit under the voice, so keep them at ~half the pop level.
+        bell, send = a.sfx / "bell.wav", a.sfx / "send.wav"
         for t0 in spaced(bell_times, 0.3):
-            if bell.exists() and t0 <= D - 0.4: cue(bell, "sfx_bell", t0, 0.3)
+            if bell.exists() and t0 <= D - 0.4: cue(bell, "sfx_bell", t0, 0.12)
         for t0 in spaced(send_times, 0.3):
-            if send.exists() and t0 <= D - 0.3: cue(send, "sfx_send", t0, 0.3)
+            if send.exists() and t0 <= D - 0.3: cue(send, "sfx_send", t0, 0.12)
 
         out_base = (a.work / "capcut").resolve(); out_base.mkdir(parents=True, exist_ok=True)
         ch._post("/save_draft", {"draft_id": draft, "draft_folder": str(out_base), "auto_deploy": False})
