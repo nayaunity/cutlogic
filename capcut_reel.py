@@ -102,7 +102,7 @@ def popup_sheet(video: Path, segs: list, popups: list, logos: Path, out: Path) -
         return
     import subprocess
     tiles = []
-    for t, f, side in popups[:8]:
+    for t, f, side, ty in popups[:16]:
         src_t, cursor = None, 0.0
         for s, e in segs:  # map the output time back to the source footage
             if cursor <= t < cursor + (e - s):
@@ -115,18 +115,23 @@ def popup_sheet(video: Path, segs: list, popups: list, logos: Path, out: Path) -
                         "-vf", f"scale={CANVAS[0]}:{CANVAS[1]}", str(frame)], check=False)
         if not frame.exists():
             continue
-        fr = Image.open(frame).convert("RGBA"); lg = Image.open(logos / f).convert("RGBA")
-        lg.thumbnail((int(CANVAS[0] * POPUP_SCALE), int(CANVAS[0] * POPUP_SCALE)))
-        cx = int(CANVAS[0] / 2 + (-1 if side == "left" else 1) * X_POPUP * CANVAS[0] / 2)
-        cy = int(CANVAS[1] / 2 - Y_POPUP * CANVAS[1] / 2)
+        fr = Image.open(frame).convert("RGBA"); lg = Image.open(f).convert("RGBA")
+        if side == "sticker":   # 1080-wide strip, 1:1
+            cx = CANVAS[0] // 2
+        else:
+            lg.thumbnail((int(CANVAS[0] * POPUP_SCALE), int(CANVAS[0] * POPUP_SCALE)))
+            cx = int(CANVAS[0] / 2 + (-1 if side == "left" else 1) * X_POPUP * CANVAS[0] / 2)
+        cy = int(CANVAS[1] / 2 - ty * CANVAS[1] / 2)
         fr.alpha_composite(lg, (cx - lg.width // 2, cy - lg.height // 2))
         tiles.append(fr.resize((CANVAS[0] // 4, CANVAS[1] // 4)))
         frame.unlink()
     if not tiles:
         return
-    sheet = Image.new("RGB", (len(tiles) * (CANVAS[0] // 4 + 8), CANVAS[1] // 4), (30, 30, 30))
+    cols = min(6, len(tiles)); rows = (len(tiles) + cols - 1) // cols
+    tw, th = CANVAS[0] // 4 + 8, CANVAS[1] // 4 + 8
+    sheet = Image.new("RGB", (cols * tw, rows * th), (30, 30, 30))
     for i, tile in enumerate(tiles):
-        sheet.paste(tile, (i * (CANVAS[0] // 4 + 8), 0), tile)
+        sheet.paste(tile, ((i % cols) * tw, (i // cols) * th), tile)
     sheet.save(out, quality=85)
     print(f"pop-up placement sheet -> {out}")
 
@@ -179,6 +184,7 @@ def main():
     ap.add_argument("--sfx", type=Path, required=True)
     ap.add_argument("--name", required=True)
     ap.add_argument("--cta", default="GAMMA")
+    ap.add_argument("--stickers", type=Path, help="JSON plan of stickers (see stickers.py) anchored to spoken phrases")
     ap.add_argument("--work", type=Path, default=Path("work"))
     a = ap.parse_args()
 
@@ -294,7 +300,7 @@ def main():
             if w["start"] - last_logo.get(f, -99) < 20: continue
             if any(abs(w["start"] - t0) < 6 for t0 in last_logo.values()): continue
             st, en = off_joins(w["start"], w["start"] + 2.5)
-            popups.append((st, f, side))
+            popups.append((st, logos / f, side, Y_POPUP))
             post("/add_image", {"image_url": str((logos / f).resolve()), "start": st, "end": en, "transform_y": Y_POPUP,
                                 "transform_x": -X_POPUP if side == "left" else X_POPUP, "scale_x": POPUP_SCALE, "scale_y": POPUP_SCALE,
                                 "track_name": "image_popups", "intro_animation": "Slide_Right" if side == "left" else "Slide_Left",
@@ -302,8 +308,10 @@ def main():
             last_logo[f] = w["start"]; side = "right" if side == "left" else "left"; n["popups"] += 1; pop_times.append(st)
 
         # 5. badges: chapter marks, stamps, CTA held to the end
+        badge_times = [(0.0, 4.8)]  # the hook title owns the top band first
         def badge(text, st, en, hold=False):
             st, en = (st, en) if hold else off_joins(st, en)
+            badge_times.append((st, en))
             post("/add_text", {"text": text, "start": st, "end": en, "font": FONT, "font_color": WHITE, "font_size": 9,
                                "letter_spacing": 0.02, "transform_x": X_BADGE, "transform_y": Y_BADGE, "track_name": "text_badges",
                                "background_color": OXBLOOD, "background_alpha": 1.0, "background_round_radius": 1.0,
@@ -338,6 +346,55 @@ def main():
         post("/add_text", {"text": "SEPTEMBER", "start": 0, "end": 4.8, "font": FONT, "font_color": BUTTER, "font_size": 19,
                            "letter_spacing": TRACK, "transform_y": Y_HOOK_2, "track_name": "text_title_accent",
                            "intro_animation": "Bounce_In", "intro_duration": 0.35, "outro_animation": "Fade_Out", "outro_duration": 0.4})
+
+        # 6b. stickers: iMessage threads, search bars, notifications, cards drawn by
+        # stickers.py as 1080-wide strips (1:1 at scale 1.0), in the band under the
+        # 20% crop, never over a badge or across a cut join.
+        if a.stickers:
+            import stickers as stk
+            plan = json.loads(a.stickers.read_text())
+            norm_words = [norm(w["text"]) for w in words]
+            def find_phrase(phrase, after=0.0):
+                toks = [norm(x) for x in phrase.split()]
+                for i in range(len(words) - len(toks) + 1):
+                    if words[i]["start"] >= after and norm_words[i:i + len(toks)] == toks:
+                        return words[i]["start"]
+                return None
+            def overlaps(st, en, spans, pad=0.15):
+                return any(st < e + pad and en > s - pad for s, e in spans)
+            sticker_dir = a.work / "capcut" / "stickers"
+            sticker_spans, cursor_after = [], 0.0
+            for i, spec in enumerate(plan):
+                at = find_phrase(spec["at"], after=cursor_after)
+                if at is None:
+                    print(f"note: sticker anchor '{spec['at']}' not found, skipped", file=sys.stderr); continue
+                cursor_after = at
+                st = max(0.0, at + spec.get("delay", 0.0))
+                hold = spec.get("dur", 3.0) >= 90
+                en = D if hold else min(D - 0.02, st + spec.get("dur", 3.0))
+                for _ in range(6):  # slide later past badges / other stickers (a held CTA sticker stays put: align it in the plan)
+                    if not hold and (overlaps(st, en, badge_times) or overlaps(st, en, sticker_spans)):
+                        later = [e for s, e in badge_times + sticker_spans if s < en + 0.15 and e + 0.15 > st]
+                        st = max(later) + 0.2; en = D if hold else min(D - 0.02, st + spec.get("dur", 3.0))
+                        continue
+                    break
+                if not hold:
+                    st, en = off_joins(st, en)
+                if en - st < 1.0:
+                    continue
+                png = stk.render(spec, sticker_dir / f"{i:02d}_{spec['kind']}.png")
+                from PIL import Image as _Im
+                h = _Im.open(png).height
+                cy = SAFE_TOP * CANVAS[1] + 16 + h / 2            # top of the strip just under the crop line
+                ty = round((CANVAS[1] / 2 - cy) / (CANVAS[1] / 2), 3)
+                body = {"image_url": str(png.resolve()), "start": round(st, 3), "end": round(en, 3), "transform_y": ty,
+                        "transform_x": 0, "scale_x": 1.0, "scale_y": 1.0, "track_name": "image_stickers",
+                        "intro_animation": spec.get("anim", "Zoom_In"), "intro_animation_duration": 0.4}
+                if not hold:
+                    body.update({"outro_animation": "Fade_Out", "outro_animation_duration": 0.3})
+                post("/add_image", body)
+                sticker_spans.append((st, en)); pop_times.append(st); n["stickers"] = n.get("stickers", 0) + 1
+                popups.append((st, png, "sticker", ty))
 
         # 7. zooms: slow drift on the hook clip and the month-total clip; quick punches on keywords and figures
         kf = lambda times, vals: post("/add_video_keyframe", {"track_name": "video_main", "property_types": ["uniform_scale"] * len(times),  # noqa: E731
@@ -378,7 +435,7 @@ def main():
             proc.terminate()
 
     dest = ch.install_into_capcut(draft_dir, a.name, source=video)
-    popup_sheet(video, segs, popups, logos, a.work / f"{a.name}-popups.jpg")
+    popup_sheet(video, segs, sorted(popups, key=lambda x: x[0]), logos, a.work / f"{a.name}-popups.jpg")
     ch.open_capcut(dest)
     print(json.dumps(n), f"\ndraft \"{a.name}\" -> {dest}")
 

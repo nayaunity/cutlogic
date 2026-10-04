@@ -1,0 +1,169 @@
+[
+ {
+  "at": "apartment hunting",
+  "dur": 3.2,
+  "kind": "search",
+  "text": "apartments in new york",
+  "anim": "Slide_Down"
+ },
+ {
+  "at": "monthly recurring revenue",
+  "delay": -1.2,
+  "dur": 3.2,
+  "kind": "notification",
+  "app": "Skool",
+  "title": "Payment received",
+  "body": "Monthly recurring revenue just crossed $1,000",
+  "anim": "Slide_Down"
+ },
+ {
+  "at": "Gen Z creator program",
+  "delay": 0.4,
+  "dur": 3.4,
+  "kind": "imessage",
+  "bubbles": [
+   {
+    "from": "them",
+    "text": "Welcome to the Gen Z Creator Program!"
+   },
+   {
+    "from": "me",
+    "text": "I'm in"
+   }
+  ],
+  "anim": "Zoom_In"
+ },
+ {
+  "at": "questions in my school",
+  "delay": -0.4,
+  "dur": 3.6,
+  "kind": "imessage",
+  "bubbles": [
+   {
+    "from": "them",
+    "text": "how do you script your reels?"
+   },
+   {
+    "from": "them",
+    "text": "how are you monetizing??"
+   }
+  ],
+  "anim": "Zoom_In"
+ },
+ {
+  "at": "30,000 followers",
+  "delay": 1.0,
+  "dur": 3.0,
+  "kind": "notification",
+  "app": "Instagram",
+  "title": "+30,000 followers",
+  "body": "in 60 days",
+  "anim": "Slide_Down"
+ },
+ {
+  "at": "ManyChat flow",
+  "delay": 0.3,
+  "dur": 3.4,
+  "kind": "imessage",
+  "bubbles": [
+   {
+    "from": "them",
+    "text": "STACK"
+   },
+   {
+    "from": "me",
+    "text": "Sent! Here's your link"
+   }
+  ],
+  "anim": "Zoom_In"
+ },
+ {
+  "at": "30,000 story views",
+  "delay": 0.8,
+  "dur": 3.0,
+  "kind": "notification",
+  "app": "Instagram",
+  "title": "30,000 story views",
+  "body": "from one automated DM flow",
+  "anim": "Slide_Down"
+ },
+ {
+  "at": "content auditor",
+  "delay": 0.2,
+  "dur": 2.4,
+  "kind": "notification",
+  "app": "Workflows",
+  "title": "Content Auditor is live",
+  "body": "new AI workflow added to the community",
+  "anim": "Slide_Down"
+ },
+ {
+  "at": "brand pitch agent",
+  "delay": 0.2,
+  "dur": 2.4,
+  "kind": "notification",
+  "app": "Workflows",
+  "title": "Brand Pitch Agent is live",
+  "body": "new AI workflow added to the community",
+  "anim": "Slide_Down"
+ },
+ {
+  "at": "email subscribers",
+  "delay": 0.6,
+  "dur": 3.0,
+  "kind": "notification",
+  "app": "Mail",
+  "title": "+1,000 subscribers",
+  "body": "new email subscribers in 30 days",
+  "anim": "Slide_Down"
+ },
+ {
+  "at": "partnership",
+  "delay": 0.3,
+  "dur": 3.2,
+  "kind": "notification",
+  "app": "Contracts",
+  "title": "Contract signed",
+  "body": "$30,000 brand partnership",
+  "anim": "Slide_Down"
+ },
+ {
+  "at": "YouTube videos",
+  "delay": 0.2,
+  "dur": 3.0,
+  "kind": "search",
+  "text": "theblackfemaleengineer youtube",
+  "anim": "Slide_Down"
+ },
+ {
+  "at": "Starter Map",
+  "delay": 0.2,
+  "dur": 4.2,
+  "kind": "card",
+  "title": "AI Dream Life Starter Map",
+  "lines": [
+   "the questions I ask every month",
+   "the prompts I use to plan income"
+  ],
+  "tag": "FREE",
+  "anim": "Zoom_In"
+ },
+ {
+  "at": "last slide",
+  "delay": 0.0,
+  "dur": 99,
+  "kind": "imessage",
+  "bubbles": [
+   {
+    "from": "them",
+    "text": "GAMMA"
+   },
+   {
+    "from": "me",
+    "text": "Sent! Check your DMs"
+   }
+  ],
+  "anim": "Zoom_In",
+  "align": "left"
+ }
+]
